@@ -134,6 +134,7 @@ sudo systemctl enable --now luxpower-bot-public luxpower-bot-private
 | Command | Description |
 |---------|-------------|
 | `/status` | Current grid state, voltage, duration |
+| `/grid` | Grid availability stats (daily/weekly/monthly with visual bars) |
 | `/history` | Outage statistics for last 24 hours |
 | `/subscribe` | Enable outage notifications |
 | `/unsubscribe` | Disable notifications |

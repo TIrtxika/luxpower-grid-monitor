@@ -77,6 +77,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Цей бот показує стан електромережі.\n\n"
         "Команди:\n"
         "/status - Поточний стан\n"
+        "/grid - Статистика наявності світла\n"
         "/history - Історія відключень\n"
         "/subscribe - Підписатися на сповіщення\n"
         "/unsubscribe - Відписатися\n"
@@ -90,9 +91,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command"""
     help_text = (
         "Доступні команди:\n\n"
-        "/status - Показати поточний стан мережі\n"
+        "/status - Поточний стан мережі\n"
+        "/grid - Статистика наявності світла\n"
         "/history - Історія відключень за 24 години\n"
-        "/subscribe - Підписатися на сповіщення про відключення\n"
+        "/subscribe - Підписатися на сповіщення\n"
         "/unsubscribe - Відписатися від сповіщень\n\n"
         "Бот автоматично надсилає повідомлення при зміні стану мережі."
     )
@@ -244,6 +246,130 @@ async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "\u274c Ви відписались від сповіщень."
     )
+
+
+# =============================================================================
+# GRID AVAILABILITY STATS
+# =============================================================================
+
+DAYS_UA = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Нд']
+MONTHS_UA = [
+    '', 'Січень', 'Лютий', 'Березень', 'Квітень', 'Травень', 'Червень',
+    'Липень', 'Серпень', 'Вересень', 'Жовтень', 'Листопад', 'Грудень'
+]
+
+
+def _make_bar(on_pct: float, width: int = 16) -> str:
+    """Visual bar: on=filled, off=empty"""
+    on_blocks = round(on_pct / 100 * width)
+    return "\u2588" * on_blocks + "\u2591" * (width - on_blocks)
+
+
+def _format_grid_stats(stats: list, period_type: str) -> str:
+    """Format grid availability stats with visual bars.
+
+    period_type: 'day', 'week', 'month'
+    """
+    if not stats:
+        return "\u26a0 Недостатньо даних"
+
+    lines = []
+    total_on = 0
+    total_hours = 0
+
+    for row in stats:
+        period = row['period']
+        on_count = row['on_count'] or 0
+        total = row['total'] or 1
+
+        on_pct = on_count / total * 100
+
+        if period_type == 'day':
+            period_hours = 24.0
+            day_name = DAYS_UA[period.weekday()]
+            label = f"{day_name} {period.strftime('%d.%m')}"
+        elif period_type == 'week':
+            period_hours = 168.0
+            week_end = period + timedelta(days=6)
+            label = f"{period.strftime('%d.%m')}-{week_end.strftime('%d.%m')}"
+        else:  # month
+            # Actual days in this month
+            if period.month == 12:
+                next_month = period.replace(year=period.year + 1, month=1)
+            else:
+                next_month = period.replace(month=period.month + 1)
+            days_in_month = (next_month - period).days
+            period_hours = days_in_month * 24.0
+            label = f"{MONTHS_UA[period.month]} {period.year}"
+
+        on_hours = period_hours * on_count / total
+        off_hours = period_hours - on_hours
+        total_on += on_hours
+        total_hours += period_hours
+
+        bar = _make_bar(on_pct)
+        lines.append(f"{label:<12} {bar} {on_hours:.1f}/{off_hours:.1f}")
+
+    # Header
+    if period_type == 'day':
+        title = "\U0001f4ca Електромережа за тиждень"
+    elif period_type == 'week':
+        title = "\U0001f4ca Електромережа за місяць"
+    else:
+        title = "\U0001f4ca Електромережа за рік"
+
+    body = "\n".join(lines)
+
+    if total_hours > 0:
+        pct = total_on / total_hours * 100
+        summary = f"\nВсього: {total_on:.1f} з {total_hours:.0f} год ({pct:.1f}%)"
+    else:
+        summary = ""
+
+    return f"{title}\n\n{body}\n{summary}\n\n\u2588 є світло  \u2591 немає"
+
+
+async def cmd_grid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /grid command — grid availability statistics"""
+    db = get_db()
+    stats = db.get_daily_grid_stats(days=7)
+    message = _format_grid_stats(stats, 'day')
+
+    keyboard = [[
+        InlineKeyboardButton("Тиждень", callback_data="grid_day"),
+        InlineKeyboardButton("Місяць", callback_data="grid_week"),
+        InlineKeyboardButton("Рік", callback_data="grid_month"),
+    ]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(message, reply_markup=reply_markup)
+
+
+async def callback_grid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle grid view switching"""
+    query = update.callback_query
+    await query.answer()
+
+    period_type = query.data.replace("grid_", "")
+    db = get_db()
+
+    if period_type == 'day':
+        stats = db.get_daily_grid_stats(days=7)
+    elif period_type == 'week':
+        stats = db.get_weekly_grid_stats(weeks=4)
+    else:
+        stats = db.get_monthly_grid_stats(months=6)
+
+    message = _format_grid_stats(stats, period_type)
+
+    keyboard = [[
+        InlineKeyboardButton("Тиждень", callback_data="grid_day"),
+        InlineKeyboardButton("Місяць", callback_data="grid_week"),
+        InlineKeyboardButton("Рік", callback_data="grid_month"),
+    ]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(message, reply_markup=reply_markup)
 
 
 # =============================================================================
@@ -428,8 +554,10 @@ def run_public_bot():
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
+    app.add_handler(CommandHandler("grid", cmd_grid))
 
     app.add_handler(CallbackQueryHandler(callback_history_detail, pattern="^history_"))
+    app.add_handler(CallbackQueryHandler(callback_grid, pattern="^grid_"))
 
     # Setup alerts
     alert_manager = AlertManager(app.bot)
