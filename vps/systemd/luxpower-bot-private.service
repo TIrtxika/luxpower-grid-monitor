@@ -1,0 +1,28 @@
+[Unit]
+Description=LuxPower Private Telegram Bot
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=luxpower
+Group=luxpower
+WorkingDirectory=/opt/luxpower
+EnvironmentFile=/opt/luxpower/.env
+ExecStart=/opt/luxpower/venv/bin/python3 bot.py --bot private
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=luxpower-bot-private
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/luxpower
+
+[Install]
+WantedBy=multi-user.target

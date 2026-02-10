@@ -1,0 +1,8 @@
+# LuxPower Data Collector - RPi Dependencies
+
+# REST API
+flask>=2.3.0
+gunicorn>=21.0.0
+
+# Utilities
+requests>=2.31.0

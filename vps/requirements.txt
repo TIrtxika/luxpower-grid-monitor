@@ -1,0 +1,16 @@
+# LuxPower Telegram Bot - VPS Dependencies
+
+# Telegram Bot
+python-telegram-bot>=20.0
+
+# Database
+psycopg2-binary>=2.9.0
+
+# HTTP Client
+requests>=2.31.0
+
+# Charts
+matplotlib>=3.7.0
+
+# Utilities
+python-dotenv>=1.0.0

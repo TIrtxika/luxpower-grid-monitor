@@ -1,0 +1,28 @@
+[Unit]
+Description=LuxPower REST API
+After=network.target luxpower-collector.service
+Wants=luxpower-collector.service
+
+[Service]
+Type=simple
+# Замініть YOUR_USER на ім'я користувача на RPi
+User=YOUR_USER
+Group=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/luxpower
+ExecStart=/home/YOUR_USER/luxpower/venv/bin/gunicorn -w 2 -b 0.0.0.0:8080 api:app
+Restart=always
+RestartSec=5
+
+# Логування
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=luxpower-api
+
+# Безпека
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/tmp
+
+[Install]
+WantedBy=multi-user.target

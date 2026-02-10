@@ -1,0 +1,27 @@
+[Unit]
+Description=LuxPower Data Collector
+After=network.target
+
+[Service]
+Type=simple
+# Замініть YOUR_USER на ім'я користувача на RPi
+User=YOUR_USER
+Group=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/luxpower
+ExecStart=/home/YOUR_USER/luxpower/venv/bin/python3 collector.py
+Restart=always
+RestartSec=10
+
+# Логування
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=luxpower-collector
+
+# Безпека
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/tmp
+
+[Install]
+WantedBy=multi-user.target
