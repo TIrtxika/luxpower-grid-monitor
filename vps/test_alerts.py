@@ -188,6 +188,27 @@ class OwnerChannelsTest(unittest.TestCase):
         downtime = self.unknown(False, 'monitor_downtime', 7200)
         self.assertEqual((downtime.priority, downtime.tags), (3, ('warning',)))
 
+    def low_battery(self, level, soc, fc):
+        channel = FakeChannel()
+        private = bot()
+        with patch.object(alerts.config, 'OWNER_CHAT_ID', 42):
+            asyncio.run(AlertManager(bot(), private, owner_channels=[channel])
+                        ._send_low_battery(level, soc, fc))
+        return channel.notices[0], private.send_message.await_args.kwargs['text']
+
+    def test_low_battery_warning_with_forecast(self):
+        from battery import Forecast
+        n, text = self.low_battery(30, 29, Forecast(29, 18.0, 6000))
+        self.assertEqual((n.priority, n.tags), (4, ('battery',)))
+        self.assertEqual(n.title, "Батарея 29%")
+        self.assertIn("1 год 40 хв", n.message)
+        self.assertIn("1 год 40 хв", text)
+
+    def test_critical_battery_is_urgent(self):
+        n, _ = self.low_battery(15, 14, None)
+        self.assertEqual((n.priority, n.tags), (5, ('rotating_light',)))
+        self.assertIn("прогноз ще недоступний", n.message)
+
     def test_channel_failure_does_not_stop_telegram(self):
         public = self.grid(GridChange('off', 0, None, False), FakeChannel(fail=True),
                            subscribers=[1, 2])

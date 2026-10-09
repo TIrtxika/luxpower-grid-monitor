@@ -13,6 +13,7 @@ from typing import Optional, Dict, Callable, List
 import requests
 
 import config
+from battery import LowBatteryWatch, forecast as battery_forecast
 from database import get_db
 from grid_state import (
     StateTracker, Transition, GridChange, ON, OFF, UNKNOWN,
@@ -54,9 +55,13 @@ class RpiPoller:
         self._unknown_since: float = 0       # start of the unknown period
         self._unknown_alert_from: float = 0  # 🟡 alert threshold counts from here
 
+        # SOC of the current outage, low-battery thresholds
+        self.battery_watch = LowBatteryWatch(config.BATTERY_ALERT_LEVELS)
+
         # Callbacks
         self._state_callbacks: List[Callable] = []
         self._unknown_callbacks: List[Callable] = []
+        self._battery_callbacks: List[Callable] = []
 
     def _new_tracker(self, **seed) -> StateTracker:
         return StateTracker(
@@ -73,6 +78,10 @@ class RpiPoller:
     def add_unknown_callback(self, callback: Callable):
         """Add callback(active, reason, seconds) for unknown-state alerts"""
         self._unknown_callbacks.append(callback)
+
+    def add_battery_callback(self, callback: Callable):
+        """Add callback(level, soc, forecast) for low battery during an outage"""
+        self._battery_callbacks.append(callback)
 
     def _get_headers(self) -> Dict:
         """Get API request headers"""
@@ -272,10 +281,46 @@ class RpiPoller:
             self._on_transition(transition, closed)
 
         self._check_unknown_alert(now)
+        self._check_battery(status, now)
 
         if status is not None:
             self._maybe_store(status, now)
         self._maybe_cleanup(now)
+        self._ping_watchdog()
+
+    def _check_battery(self, status: Optional[Dict], now: float):
+        """Low-battery thresholds while the grid is off; re-arm when it is on"""
+        if self.tracker.state == ON:
+            self.battery_watch.reset()
+            return
+        if self.tracker.state != OFF or not status:
+            return
+        soc = (status.get('battery') or {}).get('soc')
+        if soc is None:
+            return
+        level = self.battery_watch.observe(now, soc)
+        if level is None:
+            return
+        fc = battery_forecast(self.battery_watch.samples, now,
+                              config.BATTERY_EMPTY_SOC)
+        logger.warning(f"Battery {soc}% crossed {level}% during outage")
+        for callback in self._battery_callbacks:
+            try:
+                callback(level, soc, fc)
+            except Exception as e:
+                logger.error(f"Battery callback error: {e}")
+
+    def _ping_watchdog(self):
+        """Tell the external watchdog (healthchecks.io) the monitor is alive"""
+        if not config.HEALTHCHECK_URL:
+            return
+        try:
+            response = requests.get(config.HEALTHCHECK_URL, timeout=5)
+            if response.status_code >= 300:
+                logger.warning(f"Watchdog ping failed: HTTP {response.status_code}")
+        except requests.RequestException as e:
+            # The exception text contains the secret URL: log the type only
+            logger.warning(f"Watchdog ping failed: {type(e).__name__}")
 
     def _run_loop(self):
         """Main polling loop"""

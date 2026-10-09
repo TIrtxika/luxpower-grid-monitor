@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 PRIORITY_LOW = 2
 PRIORITY_DEFAULT = 3
 PRIORITY_HIGH = 4
+PRIORITY_URGENT = 5
 
 
 @dataclass(frozen=True)

@@ -207,6 +207,12 @@ def format_inverter_details(status: Dict) -> str:
     )
 
 
+def format_battery_line(fc) -> str:
+    """'🪫 Батареї вистачить ще ~1 год 40 хв (−18%/год)' from battery.Forecast"""
+    return (f"\U0001faab Батареї вистачить ще ~{format_duration(fc.seconds_left)} "
+            f"(−{fc.rate_per_hour:.0f}%/год)")
+
+
 def status_from_sample(row: Dict) -> Dict:
     """inverter_status DB row -> RPi-style status dict"""
     return {
