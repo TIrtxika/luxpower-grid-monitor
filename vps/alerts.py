@@ -22,6 +22,7 @@ from telegram.error import Forbidden, TelegramError
 
 import config
 from database import get_db
+from subscriptions import in_quiet_hours, wants
 from notifiers import (
     Notice, PRIORITY_DEFAULT, PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_URGENT,
 )
@@ -152,10 +153,11 @@ class AlertManager:
         return msg
 
     async def _send_message_async(self, bot: Bot, chat_id: int,
-                                  text: str) -> str:
+                                  text: str, silent: bool = False) -> str:
         """Send message; returns SEND_OK / SEND_BLOCKED / SEND_ERROR"""
         try:
-            await bot.send_message(chat_id=chat_id, text=text)
+            await bot.send_message(chat_id=chat_id, text=text,
+                                   disable_notification=silent)
             return SEND_OK
         except Forbidden as e:
             logger.warning(f"Chat {chat_id} blocked the bot: {e}")
@@ -200,22 +202,27 @@ class AlertManager:
                                             change.approximate)
 
         try:
-            subscribers = db.get_active_subscribers()
+            subscribers = db.get_subscriber_settings()
         except Exception as e:
             logger.error(f"Failed to load subscribers: {e}")
             subscribers = []
 
         logger.info(f"Sending grid alert to {len(subscribers)} subscribers")
 
-        for chat_id in subscribers:
-            result = await self._send_message_async(self.public_bot, chat_id,
-                                                     message)
+        now = kyiv_now()
+        for settings in subscribers:
+            if not wants(settings, grid_on):
+                continue
+            # Quiet hours: deliver without sound, never drop the message
+            result = await self._send_message_async(
+                self.public_bot, settings.chat_id, message,
+                silent=in_quiet_hours(settings, now))
             if result == SEND_BLOCKED:
                 try:
-                    db.remove_subscriber(chat_id)
-                    logger.info(f"Deactivated subscriber {chat_id}")
+                    db.remove_subscriber(settings.chat_id)
+                    logger.info(f"Deactivated subscriber {settings.chat_id}")
                 except Exception as e:
-                    logger.error(f"Failed to deactivate {chat_id}: {e}")
+                    logger.error(f"Failed to deactivate {settings.chat_id}: {e}")
 
         # Send to public channel if configured
         if config.PUBLIC_CHANNEL_ID:

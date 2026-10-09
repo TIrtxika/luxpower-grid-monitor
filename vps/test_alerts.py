@@ -5,6 +5,7 @@ Run: python -m unittest test_alerts
 
 import asyncio
 import unittest
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from telegram.error import Forbidden, TelegramError
@@ -12,9 +13,16 @@ from telegram.error import Forbidden, TelegramError
 import alerts
 from alerts import AlertManager
 from grid_state import GridChange
+from subscriptions import Settings
 
 STATUS = {'grid': {'available': True, 'voltage': 231},
           'battery': {'soc': 80}, 'output': {}, 'temperature': {}}
+
+
+def subs(*chat_ids, **settings):
+    """Subscriber settings; quiet hours off by default so tests don't depend on the clock"""
+    settings.setdefault('quiet_enabled', False)
+    return [Settings(chat_id, **settings) for chat_id in chat_ids]
 
 
 def bot(side_effect=None):
@@ -34,14 +42,14 @@ class GridAlertTest(unittest.TestCase):
         calls = []
         db = MagicMock()
         db.save_event.side_effect = lambda *a, **k: calls.append('save')
-        db.get_active_subscribers.return_value = [1]
+        db.get_subscriber_settings.return_value = subs(1)
         public = bot(side_effect=lambda **k: calls.append('send'))
         self.run_alert(AlertManager(public), db, GridChange('off', 0, None, False))
         self.assertEqual(calls, ['save', 'send'])
 
     def test_event_saved_even_if_sending_fails(self):
         db = MagicMock()
-        db.get_active_subscribers.return_value = [1, 2]
+        db.get_subscriber_settings.return_value = subs(1, 2)
         public = bot(side_effect=TelegramError("boom"))
         self.run_alert(AlertManager(public), db, GridChange('off', 0, None, False))
         db.save_event.assert_called_once()
@@ -49,14 +57,14 @@ class GridAlertTest(unittest.TestCase):
 
     def test_blocked_subscriber_is_deactivated(self):
         db = MagicMock()
-        db.get_active_subscribers.return_value = [1, 2]
+        db.get_subscriber_settings.return_value = subs(1, 2)
         public = bot(side_effect=[Forbidden("bot was blocked by the user"), None])
         self.run_alert(AlertManager(public), db, GridChange('on', 0, 600, False))
         db.remove_subscriber.assert_called_once_with(1)
 
     def test_owner_gets_detail_via_private_bot(self):
         db = MagicMock()
-        db.get_active_subscribers.return_value = []
+        db.get_subscriber_settings.return_value = subs()
         private = bot()
         self.run_alert(AlertManager(bot(), private), db,
                        GridChange('on', 0, 600, False))
@@ -68,6 +76,37 @@ class GridAlertTest(unittest.TestCase):
         text = am._format_grid_message(True, STATUS, 3900, approximate=True)
         self.assertIn("1 год 5 хв", text)
         self.assertIn("приблизний", text)
+
+
+class SubscriberDeliveryTest(unittest.TestCase):
+    def deliver(self, settings, change, kyiv_time):
+        db = MagicMock()
+        db.get_subscriber_settings.return_value = settings
+        public = bot()
+        with patch.object(alerts, 'get_db', return_value=db), \
+             patch.object(alerts, 'kyiv_now', return_value=kyiv_time), \
+             patch.object(alerts.config, 'OWNER_CHAT_ID', 0), \
+             patch.object(alerts.config, 'PUBLIC_CHANNEL_ID', ''):
+            asyncio.run(AlertManager(public).send_grid_alert(change, STATUS))
+        return {c.kwargs['chat_id']: c.kwargs.get('disable_notification')
+                for c in public.send_message.await_args_list}
+
+    def test_silent_in_quiet_hours_loud_otherwise(self):
+        night = datetime(2026, 10, 9, 23, 30, tzinfo=alerts.KYIV_TZ)
+        day = datetime(2026, 10, 9, 12, 0, tzinfo=alerts.KYIV_TZ)
+        quiet = [Settings(1)]  # defaults: quiet 23:00-07:00
+        self.assertEqual(self.deliver(quiet, GridChange('off', 0, None, False), night),
+                         {1: True})
+        self.assertEqual(self.deliver(quiet, GridChange('off', 0, None, False), day),
+                         {1: False})
+
+    def test_notify_mode_filters_events(self):
+        day = datetime(2026, 10, 9, 12, 0, tzinfo=alerts.KYIV_TZ)
+        settings = subs(1) + subs(2, notify_mode='off_only') + subs(3, notify_mode='on_only')
+        self.assertEqual(set(self.deliver(settings, GridChange('off', 0, None, False), day)),
+                         {1, 2})
+        self.assertEqual(set(self.deliver(settings, GridChange('on', 0, 60, False), day)),
+                         {1, 3})
 
 
 class UnknownAlertTest(unittest.TestCase):
@@ -148,7 +187,7 @@ class FakeChannel:
 class OwnerChannelsTest(unittest.TestCase):
     def grid(self, change, channel, subscribers=()):
         db = MagicMock()
-        db.get_active_subscribers.return_value = list(subscribers)
+        db.get_subscriber_settings.return_value = subs(*subscribers)
         public = bot()
         am = AlertManager(public, owner_channels=[channel])
         with patch.object(alerts, 'get_db', return_value=db), \
