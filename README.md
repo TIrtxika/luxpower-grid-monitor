@@ -147,6 +147,45 @@ One-off backfill from existing samples (run with the public bot stopped):
     python migrate_intervals.py --dry-run
     python migrate_intervals.py
 
+## Operations
+
+### Tests (CI)
+
+GitHub Actions (`.github/workflows/tests.yml`) runs the whole `vps/` test suite on
+Python 3.11 with a PostgreSQL 15 service for every pull request and push to `main`.
+Locally: `cd vps && TEST_DATABASE_URL=postgresql://... python -m unittest discover -s . -p 'test_*.py'`
+(DB integration tests are skipped without `TEST_DATABASE_URL`).
+
+### Deploy (`vps/ops/deploy.sh`)
+
+On the dev machine, make a checksum manifest of the commit to deploy:
+
+    for f in $(git ls-tree --name-only <commit> vps/ | grep -E '\.py$|requirements.txt' | grep -v '/test_'); do
+        printf '%s  %s\n' "$(git show <commit>:$f | sha256sum | cut -d' ' -f1)" "$(basename $f)"
+    done > manifest.sha256
+
+Copy the manifest to the VPS and run:
+
+    sudo /opt/luxpower/ops/deploy.sh <commit> /tmp/manifest.sha256
+
+The script downloads the commit from GitHub, refuses to deploy if any file does not
+match the manifest, compiles the code, backs up `/opt/luxpower` code to
+`/var/backups/luxpower/code-<timestamp>`, installs, restarts both bots and fails
+(printing the rollback command) on inactive units, tracebacks, `[ERROR]` lines or
+bot-token URLs in the logs.
+
+### Database backups
+
+`luxpower-db-backup.timer` runs `vps/ops/backup-db.sh` daily at 03:00 Kyiv time
+(`Persistent=true` catches up after downtime): gzipped `pg_dump` into
+`/var/backups/luxpower/daily/` (mode 600), newest 14 kept.
+
+    sudo install -o root -g root -m 755 vps/ops/*.sh /opt/luxpower/ops/
+    sudo cp vps/systemd/luxpower-db-backup.* /etc/systemd/system/
+    sudo systemctl daemon-reload && sudo systemctl enable --now luxpower-db-backup.timer
+
+Restore: `gunzip -c <dump>.sql.gz | sudo -u postgres psql luxpower` (into an empty DB).
+
 ## Telegram Commands
 
 ### Public Bot

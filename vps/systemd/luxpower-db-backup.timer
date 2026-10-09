@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily LuxPower database backup
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 Europe/Kyiv
+RandomizedDelaySec=10min
+# Run a missed backup after the VM was stopped
+Persistent=true
+
+[Install]
+WantedBy=timers.target
