@@ -4,17 +4,18 @@ PostgreSQL storage for inverter data and events
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 from contextlib import contextmanager
 
 import psycopg2
 from psycopg2 import sql
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import Json, RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 
 import config
 from stats import Interval
+from schedule import DaySchedule, day_from_dict, day_to_dict
 from subscriptions import Settings
 
 logger = logging.getLogger(__name__)
@@ -128,7 +129,21 @@ class Database:
                             NOT NULL DEFAULT '07:00',
                         ADD COLUMN IF NOT EXISTS notify_mode TEXT
                             NOT NULL DEFAULT 'all'
-                            CHECK (notify_mode IN ('all', 'off_only', 'on_only'));
+                            CHECK (notify_mode IN ('all', 'off_only', 'on_only')),
+                        ADD COLUMN IF NOT EXISTS remind_enabled BOOLEAN
+                            NOT NULL DEFAULT TRUE;
+                """)
+
+                # Графік планових відключень групи (YASNO), по днях
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS planned_outages (
+                        day DATE NOT NULL,
+                        grp TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        outages JSONB NOT NULL,
+                        fetched_at TIMESTAMPTZ NOT NULL,
+                        PRIMARY KEY (day, grp)
+                    );
                 """)
 
                 # Таблиця інтервалів стану мережі
@@ -493,19 +508,22 @@ class Database:
                 """)
                 return [row[0] for row in cur.fetchall()]
 
-    _SETTINGS_FIELDS = ('quiet_enabled', 'quiet_from', 'quiet_to', 'notify_mode')
+    _SETTINGS_FIELDS = ('quiet_enabled', 'quiet_from', 'quiet_to', 'notify_mode',
+                        'remind_enabled')
 
     def _settings_from_row(self, row) -> Settings:
         return Settings(chat_id=row['chat_id'], quiet_enabled=row['quiet_enabled'],
                         quiet_from=row['quiet_from'], quiet_to=row['quiet_to'],
-                        notify_mode=row['notify_mode'])
+                        notify_mode=row['notify_mode'],
+                        remind_enabled=row['remind_enabled'])
 
     def get_settings(self, chat_id: int) -> Optional[Settings]:
         """Notification settings of an active subscriber"""
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT chat_id, quiet_enabled, quiet_from, quiet_to, notify_mode
+                    SELECT chat_id, quiet_enabled, quiet_from, quiet_to, notify_mode,
+                           remind_enabled
                     FROM subscribers
                     WHERE chat_id = %s AND is_active = TRUE
                 """, (chat_id,))
@@ -517,7 +535,8 @@ class Database:
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT chat_id, quiet_enabled, quiet_from, quiet_to, notify_mode
+                    SELECT chat_id, quiet_enabled, quiet_from, quiet_to, notify_mode,
+                           remind_enabled
                     FROM subscribers
                     WHERE is_active = TRUE
                     ORDER BY id
@@ -538,6 +557,41 @@ class Database:
                         assignments),
                     (*fields.values(), chat_id))
                 return cur.rowcount > 0
+
+    # =========================================================================
+    # PLANNED OUTAGES (schedule)
+    # =========================================================================
+
+    def save_schedule(self, group: str, days: List[DaySchedule],
+                      fetched_at: datetime) -> None:
+        """Upsert the schedule of a group, one row per day"""
+        if not days:
+            return
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                for d in days:
+                    cur.execute("""
+                        INSERT INTO planned_outages (day, grp, status, outages, fetched_at)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (day, grp) DO UPDATE
+                        SET status = EXCLUDED.status, outages = EXCLUDED.outages,
+                            fetched_at = EXCLUDED.fetched_at
+                    """, (d.day, group, d.status,
+                          Json(day_to_dict(d)['outages']), fetched_at))
+
+    def get_schedule(self, group: str, from_day: date,
+                     to_day: date) -> List[DaySchedule]:
+        """Stored schedule of a group for days in [from_day, to_day]"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT day, status, outages FROM planned_outages
+                    WHERE grp = %s AND day BETWEEN %s AND %s
+                    ORDER BY day
+                """, (group, from_day, to_day))
+                return [day_from_dict({'day': day.isoformat(), 'status': status,
+                                       'outages': outages})
+                        for day, status, outages in cur.fetchall()]
 
     def is_subscribed(self, chat_id: int) -> bool:
         """Check if chat is subscribed"""

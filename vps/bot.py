@@ -42,11 +42,12 @@ import stats as grid_stats
 import menus
 from messages import (
     format_history_summary, format_inverter_details, format_outages,
-    format_battery_line, format_periods, format_settings, format_stats,
-    format_traffic_light,
+    format_battery_line, format_periods, format_plan_fact, format_settings,
+    format_stats, format_traffic_light,
     status_from_sample,
 )
 from battery import forecast as battery_forecast
+import schedule as dtek_schedule
 from subscriptions import MODES, QUIET_WINDOWS
 import charts
 from notifiers import Notice, ntfy_from_config
@@ -123,12 +124,28 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/subscribe - Підписатися на сповіщення\n"
         "/unsubscribe - Відписатися від сповіщень\n"
         "/settings - Тихі години (за замовчуванням 23:00–07:00 беззвучно) "
-        "та які сповіщення надсилати\n\n"
+        "та які сповіщення надсилати, нагадування за графіком ДТЕК\n\n"
         "\U0001f7e2 є світло  \U0001f534 немає  \U0001f7e1 невідомо\n"
         "Бот автоматично надсилає повідомлення при зміні стану мережі."
     )
     await update.message.reply_text(help_text,
                                     reply_markup=menus.public_keyboard())
+
+
+def _schedule_line(now: datetime, watch=None) -> Optional[str]:
+    """📅 line of /status: poller memory (public bot) or the DB"""
+    if not config.DTEK_GROUP:
+        return None
+    days = watch.days(now) if watch is not None else []
+    if not days:
+        today = now.astimezone(KYIV_TZ).date()
+        try:
+            days = get_db().get_schedule(config.DTEK_GROUP, today,
+                                         today + timedelta(days=1))
+        except Exception as e:
+            logger.warning(f"Failed to load schedule: {type(e).__name__}")
+            return None
+    return dtek_schedule.describe(days, now)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -157,6 +174,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = format_traffic_light(state, reason, since, now,
                                    voltage=voltage, data_age_s=data_age)
+    schedule_line = _schedule_line(now, poller.schedule)
+    if schedule_line:
+        message += "\n" + schedule_line
     message += f"\n\nОновлено: {kyiv_now().strftime('%H:%M:%S')}"
     await update.message.reply_text(message)
 
@@ -171,8 +191,16 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if settings is None:
         await update.message.reply_text(NOT_SUBSCRIBED)
         return
-    await update.message.reply_text(format_settings(settings),
-                                    reply_markup=menus.settings_keyboard(settings))
+    text, markup = _settings_view(settings)
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+def _settings_view(settings):
+    """/settings text and keyboard; schedule reminders only with DTEK_GROUP"""
+    reminders = bool(config.DTEK_GROUP)
+    text = format_settings(
+        settings, config.SCHEDULE_REMIND_MINUTES if reminders else None)
+    return text, menus.settings_keyboard(settings, reminders=reminders)
 
 
 def _settings_change(data: str) -> Optional[dict]:
@@ -188,6 +216,8 @@ def _settings_change(data: str) -> Optional[dict]:
         return {'quiet_from': start, 'quiet_to': end}
     if kind == 'mode' and value in MODES:
         return {'notify_mode': value}
+    if kind == 'remind' and value in ('on', 'off'):
+        return {'remind_enabled': value == 'on'}
     return None
 
 
@@ -207,8 +237,8 @@ async def callback_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.update_settings(chat_id, **change)
     settings = db.get_settings(chat_id)
     await query.answer("Збережено")
-    await query.edit_message_text(format_settings(settings),
-                                  reply_markup=menus.settings_keyboard(settings))
+    text, markup = _settings_view(settings)
+    await query.edit_message_text(text, reply_markup=markup)
 
 
 @db_guarded
@@ -454,6 +484,9 @@ async def cmd_full_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     battery_line = _battery_line(db, open_iv, now)
     if battery_line:
         header += "\n" + battery_line
+    schedule_line = _schedule_line(now)
+    if schedule_line:
+        header += "\n" + schedule_line
 
     # Fresh data from the RPi without blocking the bot's event loop
     status = await asyncio.to_thread(fetch_status_direct)
@@ -537,7 +570,35 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      grid_stats.outage_summary(
                          grid_stats.outages(intervals, start, now))))
 
-    await update.message.reply_text(format_stats(rows))
+    text = format_stats(rows)
+    plan_fact = _plan_fact_line(intervals, now, timedelta(days=7))
+    if plan_fact:
+        text += "\n\n" + plan_fact
+    await update.message.reply_text(text)
+
+
+def _plan_fact_line(intervals, now: datetime, length: timedelta) -> Optional[str]:
+    """Planned vs actual outage time, since the schedule has been collected"""
+    if not config.DTEK_GROUP:
+        return None
+    start = now - length
+    today = now.astimezone(KYIV_TZ).date()
+    try:
+        days = get_db().get_schedule(config.DTEK_GROUP,
+                                     start.astimezone(KYIV_TZ).date(), today)
+    except Exception as e:
+        logger.warning(f"Failed to load schedule: {type(e).__name__}")
+        return None
+    if not days:
+        return "\U0001f4c5 План / факт: графік ще не зібрано"
+    first = datetime.combine(days[0].day, datetime.min.time(), KYIV_TZ)
+    if first <= start:
+        label = f"за {length.days} днів"
+    else:
+        start, label = first, f"з {first:%d.%m}"
+    planned = dtek_schedule.planned_seconds(days, start, now)
+    fact = grid_stats.window_stats(intervals, start, now).off
+    return format_plan_fact(label, planned, fact)
 
 
 @owner_only
@@ -616,6 +677,9 @@ def run_public_bot():
         poller.add_state_callback(alert_manager.on_grid_change)
         poller.add_unknown_callback(alert_manager.on_unknown_change)
         poller.add_battery_callback(alert_manager.on_low_battery)
+        if poller.schedule is not None:
+            poller.schedule.add_reminder_callback(alert_manager.on_planned_outage)
+            poller.schedule.add_group_callback(alert_manager.on_group_change)
         poller.start()
 
     async def on_stop(application: Application):

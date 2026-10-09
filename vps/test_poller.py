@@ -274,6 +274,28 @@ class PollerTest(unittest.TestCase):
         self.assertEqual(h.db.switches, [('on', dt(0))])
         self.assertEqual(h.changes, [])
 
+    def test_schedule_watch_ticks_every_poll_and_errors_are_contained(self):
+        h = Harness(seeded('on'))
+        watch = MagicMock()
+        watch.tick.side_effect = [RuntimeError('yasno down'), None]
+        h.poller.schedule = watch
+        h.poll(0, st(True))
+        h.poll(60, st(True))
+        self.assertEqual([c.args[0] for c in watch.tick.call_args_list], [0, 60])
+        self.assertEqual(len(h.db.heartbeats), 2)
+
+    def test_no_schedule_watch_without_group(self):
+        with patch.object(poller_mod.config, 'DTEK_GROUP', ''):
+            self.assertIsNone(RpiPoller(db_factory=FakeDb).schedule)
+
+    def test_schedule_watch_built_from_config(self):
+        with patch.object(poller_mod.config, 'DTEK_GROUP', '16.1'), \
+             patch.object(poller_mod.config, 'YASNO_STREET_ID', 1624), \
+             patch.object(poller_mod.config, 'YASNO_HOUSE_ID', 32079):
+            watch = RpiPoller(db_factory=FakeDb).schedule
+        self.assertEqual(watch.group, '16.1')
+        self.assertIsNotNone(watch._group_check)
+
 
 if __name__ == '__main__':
     unittest.main()

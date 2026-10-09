@@ -13,6 +13,7 @@ from telegram.error import Forbidden, TelegramError
 import alerts
 from alerts import AlertManager
 from grid_state import GridChange
+from schedule import PlannedOutage
 from subscriptions import Settings
 
 STATUS = {'grid': {'available': True, 'voltage': 231},
@@ -252,6 +253,60 @@ class OwnerChannelsTest(unittest.TestCase):
         public = self.grid(GridChange('off', 0, None, False), FakeChannel(fail=True),
                            subscribers=[1, 2])
         self.assertEqual(public.send_message.await_count, 2)
+
+
+class ScheduleAlertTest(unittest.TestCase):
+    OUTAGE = PlannedOutage(datetime(2026, 10, 9, 18, tzinfo=alerts.KYIV_TZ),
+                           datetime(2026, 10, 9, 22, tzinfo=alerts.KYIV_TZ))
+
+    def remind(self, settings, kyiv_time, owner=42):
+        db = MagicMock()
+        db.get_subscriber_settings.return_value = settings
+        public, private, channel = bot(), bot(), FakeChannel()
+        am = AlertManager(public, private, owner_channels=[channel])
+        with patch.object(alerts, 'get_db', return_value=db), \
+             patch.object(alerts, 'kyiv_now', return_value=kyiv_time), \
+             patch.object(alerts.config, 'OWNER_CHAT_ID', owner):
+            asyncio.run(am._send_reminder(self.OUTAGE))
+        return public, private, channel, db
+
+    def test_reminder_to_subscribers_owner_and_channels(self):
+        day = datetime(2026, 10, 9, 17, 30, tzinfo=alerts.KYIV_TZ)
+        settings = subs(1) + subs(2, remind_enabled=False) + subs(42)
+        public, private, channel, _ = self.remind(settings, day)
+        # the owner gets it once, via the private bot
+        self.assertEqual([c.kwargs['chat_id'] for c in public.send_message.await_args_list],
+                         [1])
+        text = public.send_message.await_args.kwargs['text']
+        self.assertIn("18:00–22:00", text)
+        self.assertEqual(private.send_message.await_args.kwargs['chat_id'], 42)
+        self.assertEqual(channel.notices[0].title, "Відключення за графіком о 18:00")
+
+    def test_reminder_silent_in_quiet_hours(self):
+        night = datetime(2026, 10, 9, 23, 30, tzinfo=alerts.KYIV_TZ)
+        public, _, _, _ = self.remind([Settings(1)], night)
+        self.assertTrue(public.send_message.await_args.kwargs['disable_notification'])
+
+    def test_blocked_subscriber_deactivated_on_reminder(self):
+        day = datetime(2026, 10, 9, 17, 30, tzinfo=alerts.KYIV_TZ)
+        db = MagicMock()
+        db.get_subscriber_settings.return_value = subs(1)
+        am = AlertManager(bot(side_effect=Forbidden("blocked")))
+        with patch.object(alerts, 'get_db', return_value=db), \
+             patch.object(alerts, 'kyiv_now', return_value=day), \
+             patch.object(alerts.config, 'OWNER_CHAT_ID', 0):
+            asyncio.run(am._send_reminder(self.OUTAGE))
+        db.remove_subscriber.assert_called_once_with(1)
+
+    def test_group_change_goes_to_owner_only(self):
+        public, private, channel = bot(), bot(), FakeChannel()
+        with patch.object(alerts.config, 'OWNER_CHAT_ID', 42):
+            asyncio.run(AlertManager(public, private, owner_channels=[channel])
+                        ._send_group_change('16.1', '17.1'))
+        public.send_message.assert_not_awaited()
+        self.assertIn("17.1", private.send_message.await_args.kwargs['text'])
+        self.assertIn("DTEK_GROUP", private.send_message.await_args.kwargs['text'])
+        self.assertEqual(len(channel.notices), 1)
 
 
 if __name__ == '__main__':

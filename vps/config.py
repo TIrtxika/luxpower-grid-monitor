@@ -4,6 +4,12 @@ VPS сервер
 """
 import os
 
+
+def _int_env(name: str, default: int) -> int:
+    """Integer from the environment; an empty value means the default"""
+    value = os.environ.get(name, "").strip()
+    return int(value) if value else default
+
 # =============================================================================
 # TELEGRAM BOTS
 # =============================================================================
@@ -82,6 +88,26 @@ NTFY_URL = os.environ.get("NTFY_URL", "https://ntfy.sh")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 # Токен доступу (опціонально, для захищених топіків/self-hosted)
 NTFY_TOKEN = os.environ.get("NTFY_TOKEN", "")
+
+# =============================================================================
+# ГРАФІК ВІДКЛЮЧЕНЬ (YASNO / ДТЕК Київ)
+# =============================================================================
+# Група адреси, напр. "16.1"; порожня = графік вимкнено
+DTEK_GROUP = os.environ.get("DTEK_GROUP", "").strip()
+YASNO_SCHEDULE_URL = os.environ.get(
+    "YASNO_SCHEDULE_URL",
+    "https://app.yasno.ua/api/blackout-service/public/shutdowns/"
+    "regions/25/dsos/902/planned-outages")
+YASNO_ADDRESSES_URL = os.environ.get(
+    "YASNO_ADDRESSES_URL",
+    "https://app.yasno.ua/api/blackout-service/public/shutdowns/addresses/v2")
+# Адреса для щотижневої перевірки групи; 0 = не перевіряти
+YASNO_STREET_ID = _int_env("YASNO_STREET_ID", 0)
+YASNO_HOUSE_ID = _int_env("YASNO_HOUSE_ID", 0)
+# Як часто оновлювати графік (секунди)
+SCHEDULE_REFRESH = _int_env("SCHEDULE_REFRESH", 900)
+# За скільки хвилин до планового відключення нагадувати
+SCHEDULE_REMIND_MINUTES = _int_env("SCHEDULE_REMIND_MINUTES", 30)
 
 # =============================================================================
 # LOGGING
