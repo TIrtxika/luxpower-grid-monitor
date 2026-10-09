@@ -1,0 +1,7 @@
+[Unit]
+Description=LuxPower database backup (pg_dump)
+After=postgresql.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/luxpower/ops/backup-db.sh
