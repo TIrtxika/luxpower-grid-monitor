@@ -4,6 +4,7 @@ LuxPower Telegram Bot
 Main entry point for bot services
 """
 
+import functools
 import logging
 import sys
 import time
@@ -12,7 +13,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+import psycopg2
 import requests
+from telegram.error import TelegramError
 
 # Kyiv timezone (EET/EEST, follows DST)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -62,6 +65,28 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # Rendered charts, shared by all chats of this process
 CHART_CACHE = charts.ChartCache()
+
+DB_DOWN = "⚠ База даних тимчасово недоступна, спробуйте пізніше"
+
+
+def db_guarded(func):
+    """Answer the user instead of staying silent when the DB is unreachable"""
+    @functools.wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            return await func(update, context)
+        except psycopg2.Error as e:
+            logger.error(f"DB unavailable in {func.__name__}: {type(e).__name__}: {e}")
+            query = update.callback_query
+            if query is None:
+                await update.message.reply_text(DB_DOWN)
+                return
+            try:
+                await query.answer(DB_DOWN, show_alert=True)
+            except TelegramError:
+                # the query was already answered before the DB call
+                await query.message.reply_text(DB_DOWN)
+    return wrapper
 
 
 # =============================================================================
@@ -119,13 +144,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     now = datetime.now(timezone.utc)
-    since = None
-    try:
-        open_iv = get_db().get_open_interval()
-        if open_iv:
-            since = open_iv['started_at']
-    except Exception as e:
-        logger.warning(f"Failed to get open interval for status: {e}")
+    # In-memory state: stays right even if a write to the DB failed
+    since = poller.get_state_since()
 
     reason = None
     if state == UNKNOWN:
@@ -144,6 +164,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 NOT_SUBSCRIBED = "Спершу підпишіться на сповіщення: /subscribe"
 
 
+@db_guarded
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /settings: quiet hours and which alerts to send"""
     settings = get_db().get_settings(update.effective_chat.id)
@@ -170,6 +191,7 @@ def _settings_change(data: str) -> Optional[dict]:
     return None
 
 
+@db_guarded
 async def callback_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/settings buttons"""
     query = update.callback_query
@@ -189,6 +211,7 @@ async def callback_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                   reply_markup=menus.settings_keyboard(settings))
 
 
+@db_guarded
 async def cmd_toggle_notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """🔔 button: subscribe or unsubscribe"""
     if get_db().is_subscribed(update.effective_chat.id):
@@ -228,6 +251,7 @@ async def on_private_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await globals()[PRIVATE_ACTIONS[action]](update, context)
 
 
+@db_guarded
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /history command: last 24 hours"""
     now = datetime.now(timezone.utc)
@@ -246,6 +270,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message, reply_markup=reply_markup)
 
 
+@db_guarded
 async def callback_history_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle history detail callback: outages of the last 7 days"""
     query = update.callback_query
@@ -259,6 +284,7 @@ async def callback_history_detail(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
+@db_guarded
 async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /subscribe command"""
     chat_id = update.effective_chat.id
@@ -277,6 +303,7 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@db_guarded
 async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /unsubscribe command"""
     chat_id = update.effective_chat.id
@@ -320,12 +347,14 @@ def _grid_message(period: str) -> str:
     return format_periods(periods, period)
 
 
+@db_guarded
 async def cmd_grid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /grid command — grid availability statistics"""
     await update.message.reply_text(_grid_message('day'),
                                     reply_markup=_grid_keyboard())
 
 
+@db_guarded
 async def callback_grid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle grid view switching"""
     query = update.callback_query
@@ -491,6 +520,7 @@ async def callback_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+@db_guarded
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /stats command (private bot)"""
     now = datetime.now(timezone.utc)
@@ -529,6 +559,7 @@ async def cmd_ntfy_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+@db_guarded
 async def cmd_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /subscribers command (private bot)"""
     db = get_db()

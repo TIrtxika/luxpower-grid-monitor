@@ -142,7 +142,7 @@ class AlertManager:
         msg += f"{output.get('frequency', 0)}Hz\n\n"
 
         # Temperature
-        msg += f"\U0001f321 Температура:\n"
+        msg += "\U0001f321 Температура:\n"
         msg += f"   Інвертор: {temp.get('inverter', 0)}°C\n"
         msg += f"   Радіатор: {temp.get('radiator', 0)}°C\n"
 

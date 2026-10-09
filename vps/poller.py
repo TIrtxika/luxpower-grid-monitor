@@ -368,6 +368,12 @@ class RpiPoller:
         """'on' / 'off' / 'unknown', or None before the first poll"""
         return self.tracker.state
 
+    def get_state_since(self) -> Optional[datetime]:
+        """Start of the current effective state (in memory, not the DB)"""
+        if self.tracker.state is None:
+            return None
+        return _dt(self.tracker.since)
+
     def get_state_reason(self) -> Optional[str]:
         """Why the state is unknown (None otherwise)"""
         return self.tracker.reason

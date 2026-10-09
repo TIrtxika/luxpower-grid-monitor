@@ -10,6 +10,7 @@ venv/
 
 # Python
 __pycache__/
+.mplconfig/
 *.pyc
 *.pyo
 

@@ -262,6 +262,12 @@ class PollerTest(unittest.TestCase):
         h.poll(60, st(True))
         self.assertEqual(h.unknown, [(False, 'monitor_downtime', 3600)])
 
+    def test_state_since_in_memory(self):
+        h = Harness(seeded('on'))
+        for t in (0, 60, 120):
+            h.poll(t, st(False))
+        self.assertEqual(h.poller.get_state_since(), dt(0))
+
     def test_empty_db_first_poll_opens_interval_without_alert(self):
         h = Harness(FakeDb())
         h.poll(0, st(True))
