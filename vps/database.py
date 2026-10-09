@@ -347,17 +347,33 @@ class Database:
                 return gap_start, now
 
     def get_intervals(self, start: datetime, end: datetime) -> List[Interval]:
-        """Intervals overlapping [start, end); the open one ends at NOW()"""
+        """Intervals overlapping [start, end), plus the one before the first of
+        them (so an outage next to unknown time is marked as a lower bound).
+
+        The open interval ends at NOW(), but never later than its last
+        heartbeat + 3 polls: if the monitor stopped, that time is unknown.
+        """
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT state, started_at,
-                           COALESCE(ended_at, NOW()) AS ended_at,
-                           ended_at IS NULL AS ongoing
-                    FROM grid_intervals
-                    WHERE started_at < %s AND COALESCE(ended_at, NOW()) > %s
+                    WITH iv AS (
+                        SELECT id, state, started_at,
+                               COALESCE(ended_at, LEAST(
+                                   NOW(),
+                                   last_seen_at + make_interval(secs => %(gap)s)
+                               )) AS ended_at,
+                               ended_at IS NULL AS ongoing
+                        FROM grid_intervals
+                    )
+                    SELECT state, started_at, ended_at, ongoing
+                    FROM iv
+                    WHERE (started_at < %(end)s AND ended_at > %(start)s)
+                       OR id IN (SELECT id FROM grid_intervals
+                                 WHERE started_at < %(start)s
+                                 ORDER BY started_at DESC LIMIT 2)
                     ORDER BY started_at
-                """, (end, start))
+                """, {'start': start, 'end': end,
+                      'gap': 3 * config.POLL_INTERVAL})
                 return [Interval(row['state'], row['started_at'],
                                  row['ended_at'], row['ongoing'])
                         for row in cur.fetchall()]

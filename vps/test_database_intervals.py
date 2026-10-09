@@ -7,6 +7,7 @@ import os
 import unittest
 from datetime import datetime, time, timedelta, timezone
 
+import config
 from database import Database
 
 TEST_URL = os.environ.get('TEST_DATABASE_URL')
@@ -94,6 +95,24 @@ class GridIntervalsDbTest(unittest.TestCase):
         self.db.switch_state('on', T(0), T(0))
         self.db.switch_state('unknown', T(5), T(5))
         self.assertEqual(self.db.get_last_known_state(), 'on')
+
+    def test_intervals_include_the_one_before_the_window(self):
+        # unknown, then an outage that started long before the window:
+        # the caller needs the unknown neighbour to mark the duration "≥"
+        self.db.insert_intervals([
+            {'state': 'unknown', 'started_at': T(0), 'ended_at': T(10)},
+        ])
+        self.db.switch_state('off', T(10), T(10))
+        self.db.heartbeat(T(60))
+        ivs = self.db.get_intervals(T(50), T(60))
+        self.assertEqual([iv.state for iv in ivs], ['unknown', 'off'])
+
+    def test_open_interval_ends_at_last_heartbeat_plus_three_polls(self):
+        self.db.switch_state('on', T(0), T(0))
+        self.db.heartbeat(T(5))
+        (iv,) = self.db.get_intervals(T(-60), T(600))
+        self.assertTrue(iv.ongoing)
+        self.assertEqual(iv.end, T(5) + timedelta(seconds=3 * config.POLL_INTERVAL))
 
     def test_cleanup_status_deletes_old_rows(self):
         with self.db.get_connection() as conn:
