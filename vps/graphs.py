@@ -1,277 +1,304 @@
 """
-Graph generation for Telegram bot
-Uses matplotlib to create charts
+Chart rendering for the Telegram bots
+Object-oriented matplotlib (thread-safe, no pyplot), Kyiv time on the axes
 """
 
 import io
-import logging
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+import math
+from datetime import date, datetime, timedelta
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
-import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.colors import LinearSegmentedColormap, to_hex
+from matplotlib.figure import Figure
+from matplotlib.patches import Patch, Rectangle
 
-from database import get_db
+from stats import KYIV_TZ, HeatRow, Interval
 
-logger = logging.getLogger(__name__)
+DAYS_UA = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Нд']
 
+COLORS = {
+    'on': '#2e9d5a',
+    'off': '#d64545',
+    'unknown': '#b8bcc2',
+    'future': '#ffffff',
+    'voltage': '#2f6db5',
+    'battery': '#2e9d5a',
+    'load': '#e08a1e',
+    'grid': '#e6e8eb',
+    'text': '#2b2f33',
+}
 
-def create_voltage_chart(hours: int = 24) -> Optional[bytes]:
-    """Create grid voltage chart"""
-    db = get_db()
-    data = db.get_status_history(hours=hours)
+PERIOD_LABELS = {'24h': '24 години', '7d': '7 днів', '30d': '30 днів'}
 
-    if not data or len(data) < 2:
-        return None
+# metric -> (sample field, title, unit, color, reference lines)
+METRICS = {
+    'voltage': ('grid_voltage', 'Напруга мережі', 'V', COLORS['voltage'],
+                [(180, 'поріг')]),
+    'battery': ('battery_soc', 'Заряд батареї', '%', COLORS['battery'],
+                [(20, 'критично')]),
+    'load': ('load_power', 'Навантаження', 'W', COLORS['load'], []),
+}
 
-    try:
-        timestamps = [row['timestamp'] for row in data]
-        voltages = [row['grid_voltage'] or 0 for row in data]
+DPI = 160
 
-        fig, ax = plt.subplots(figsize=(10, 5))
-
-        ax.plot(timestamps, voltages, 'b-', linewidth=1)
-        ax.fill_between(timestamps, voltages, alpha=0.3)
-
-        # Grid availability zones
-        for i, row in enumerate(data):
-            if not row.get('grid_available', True):
-                if i > 0:
-                    ax.axvspan(timestamps[i-1], timestamps[i],
-                              alpha=0.3, color='red')
-
-        ax.set_xlabel('Час')
-        ax.set_ylabel('Напруга (V)')
-        ax.set_title(f'Напруга мережі за {hours} годин')
-
-        ax.axhline(y=180, color='r', linestyle='--', alpha=0.5, label='Поріг')
-        ax.axhline(y=220, color='g', linestyle='--', alpha=0.5, label='Норма')
-
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-        ax.xaxis.set_major_locator(mdates.HourLocator(interval=max(1, hours // 12)))
-
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=100)
-        buf.seek(0)
-        plt.close(fig)
-
-        return buf.getvalue()
-
-    except Exception as e:
-        logger.error(f"Failed to create voltage chart: {e}")
-        return None
+_HEAT_CMAP = LinearSegmentedColormap.from_list(
+    'grid', [COLORS['on'], '#f2c94c', COLORS['off']])
 
 
-def create_battery_chart(hours: int = 24) -> Optional[bytes]:
-    """Create battery SOC chart"""
-    db = get_db()
-    data = db.get_status_history(hours=hours)
+def series_with_gaps(timestamps: Sequence[datetime], values: Sequence,
+                     max_gap: timedelta) -> Tuple[list, list]:
+    """None -> NaN; a NaN point between samples further apart than max_gap
+    so the line breaks instead of bridging missing data"""
+    xs, ys = [], []
+    prev = None
+    for t, v in zip(timestamps, values):
+        if prev is not None and t - prev > max_gap:
+            xs.append(prev + (t - prev) / 2)
+            ys.append(math.nan)
+        xs.append(t)
+        ys.append(math.nan if v is None else float(v))
+        prev = t
+    return xs, ys
 
-    if not data or len(data) < 2:
-        return None
 
-    try:
-        timestamps = [row['timestamp'] for row in data]
-        soc = [row['battery_soc'] or 0 for row in data]
+def state_segments(intervals: Sequence[Interval], start: datetime,
+                   end: datetime) -> List[Tuple[str, datetime, datetime]]:
+    """Contiguous (state, from, to) covering [start, end); gaps are unknown"""
+    segments = []
+    cursor = start
+    for iv in sorted(intervals, key=lambda i: i.start):
+        a, b = max(iv.start, start), min(iv.end, end)
+        if b <= a:
+            continue
+        if a > cursor:
+            segments.append(('unknown', cursor, a))
+        segments.append((iv.state, a, b))
+        cursor = max(cursor, b)
+    if cursor < end:
+        segments.append(('unknown', cursor, end))
+    return segments
 
-        fig, ax = plt.subplots(figsize=(10, 5))
 
-        ax.plot(timestamps, soc, 'g-', linewidth=2)
-        ax.fill_between(timestamps, soc, alpha=0.3, color='green')
+def heat_color(off: Optional[float], unknown: Optional[float]) -> str:
+    """Heatmap cell: white = future, grey = mostly unknown, green..red by off share"""
+    if off is None:
+        return COLORS['future']
+    if (unknown or 0) >= 0.5:
+        return COLORS['unknown']
+    if off <= 0:
+        return COLORS['on']
+    if off >= 1:
+        return COLORS['off']
+    return to_hex(_HEAT_CMAP(off))
 
-        ax.set_xlabel('Час')
-        ax.set_ylabel('Заряд (%)')
-        ax.set_title(f'Заряд батареї за {hours} годин')
+
+def to_png(fig: Figure) -> bytes:
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight', facecolor='white')
+    return buf.getvalue()
+
+
+def _new_figure(width: float, height: float) -> Figure:
+    fig = Figure(figsize=(width, height), dpi=DPI, facecolor='white')
+    FigureCanvasAgg(fig)
+    return fig
+
+
+def _style_axes(ax):
+    ax.set_facecolor('white')
+    ax.grid(True, color=COLORS['grid'], linewidth=0.8)
+    ax.set_axisbelow(True)
+    for side in ('top', 'right'):
+        ax.spines[side].set_visible(False)
+    for side in ('left', 'bottom'):
+        ax.spines[side].set_color(COLORS['grid'])
+    ax.tick_params(colors=COLORS['text'], labelsize=9)
+
+
+# Title padding (points) that leaves room for a legend between title and plot
+TITLE_PAD_WITH_LEGEND = 30
+
+
+def _title(ax, text: str, pad: float = 10):
+    ax.set_title(text, loc='left', fontsize=13, color=COLORS['text'],
+                 fontweight='bold', pad=pad)
+
+
+def _time_axis(ax, start: datetime, end: datetime):
+    ax.set_xlim(start, end)
+    span = end - start
+    if span <= timedelta(days=1):
+        locator = mdates.HourLocator(byhour=range(0, 24, 3), tz=KYIV_TZ)
+        fmt = '%H:%M'
+    elif span <= timedelta(days=7):
+        locator = mdates.DayLocator(tz=KYIV_TZ)
+        fmt = '%d.%m'
+    else:
+        locator = mdates.DayLocator(interval=5, tz=KYIV_TZ)
+        fmt = '%d.%m'
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter(fmt, tz=KYIV_TZ))
+
+
+def _shade_states(ax, intervals: Sequence[Interval], start: datetime,
+                  end: datetime):
+    """Red background for outages, hatched grey for unknown time"""
+    for state, a, b in state_segments(intervals, start, end):
+        if state == 'off':
+            ax.axvspan(a, b, color=COLORS['off'], alpha=0.14, linewidth=0)
+        elif state == 'unknown':
+            ax.axvspan(a, b, facecolor='none', edgecolor=COLORS['unknown'],
+                       hatch='///', linewidth=0)
+
+
+def _empty_note(ax, text: str = "Немає даних за цей період"):
+    ax.text(0.5, 0.5, text, transform=ax.transAxes, ha='center', va='center',
+            color=COLORS['text'], fontsize=12, alpha=0.7)
+
+
+def _state_legend(ax):
+    """Legend in the band between the title and the plot"""
+    handles = [Patch(color=COLORS['on'], label='є світло'),
+               Patch(color=COLORS['off'], label='немає'),
+               Patch(facecolor='white', edgecolor=COLORS['unknown'], hatch='///',
+                     label='невідомо')]
+    ax.legend(handles=handles, loc='lower left', bbox_to_anchor=(0, 1.0),
+              fontsize=8, frameon=False, ncol=3, borderaxespad=0.2)
+
+
+def _draw_metric(ax, metric: str, samples: Sequence[Dict],
+                 intervals: Sequence[Interval], start: datetime, end: datetime,
+                 max_gap: timedelta):
+    field, _, unit, color, refs = METRICS[metric]
+    _style_axes(ax)
+    _shade_states(ax, intervals, start, end)
+    xs, ys = series_with_gaps([s['timestamp'] for s in samples],
+                              [s.get(field) for s in samples], max_gap)
+    if any(not math.isnan(y) for y in ys):
+        ax.plot(xs, ys, color=color, linewidth=1.6)
+    else:
+        _empty_note(ax)
+    for y, _label in refs:
+        ax.axhline(y, color=COLORS['off'], linestyle='--', linewidth=1, alpha=0.6)
+    ax.set_ylabel(unit, color=COLORS['text'])
+    if metric == 'battery':
         ax.set_ylim(0, 100)
 
-        ax.axhline(y=20, color='r', linestyle='--', alpha=0.5, label='Критично')
-        ax.axhline(y=50, color='orange', linestyle='--', alpha=0.5, label='Низько')
 
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-        ax.xaxis.set_major_locator(mdates.HourLocator(interval=max(1, hours // 12)))
-
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=100)
-        buf.seek(0)
-        plt.close(fig)
-
-        return buf.getvalue()
-
-    except Exception as e:
-        logger.error(f"Failed to create battery chart: {e}")
-        return None
+def build_metric_figure(metric: str, samples: Sequence[Dict],
+                        intervals: Sequence[Interval], start: datetime,
+                        end: datetime, period: str,
+                        max_gap: timedelta = timedelta(minutes=10)) -> Figure:
+    fig = _new_figure(10, 4.6)
+    ax = fig.add_subplot()
+    _draw_metric(ax, metric, samples, intervals, start, end, max_gap)
+    _title(ax, f"{METRICS[metric][1]} — {PERIOD_LABELS[period]}")
+    _time_axis(ax, start, end)
+    return fig
 
 
-def create_load_chart(hours: int = 24) -> Optional[bytes]:
-    """Create load power chart"""
-    db = get_db()
-    data = db.get_status_history(hours=hours)
-
-    if not data or len(data) < 2:
-        return None
-
-    try:
-        timestamps = [row['timestamp'] for row in data]
-        load = [row['load_power'] or 0 for row in data]
-
-        fig, ax = plt.subplots(figsize=(10, 5))
-
-        ax.plot(timestamps, load, 'orange', linewidth=1)
-        ax.fill_between(timestamps, load, alpha=0.3, color='orange')
-
-        ax.set_xlabel('Час')
-        ax.set_ylabel('Потужність (W)')
-        ax.set_title(f'Навантаження за {hours} годин')
-
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-        ax.xaxis.set_major_locator(mdates.HourLocator(interval=max(1, hours // 12)))
-
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        plt.grid(True, alpha=0.3)
-
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=100)
-        buf.seek(0)
-        plt.close(fig)
-
-        return buf.getvalue()
-
-    except Exception as e:
-        logger.error(f"Failed to create load chart: {e}")
-        return None
+def build_combined_figure(samples: Sequence[Dict], intervals: Sequence[Interval],
+                          start: datetime, end: datetime, period: str,
+                          max_gap: timedelta = timedelta(minutes=10)) -> Figure:
+    fig = _new_figure(10, 9)
+    axes = fig.subplots(3, 1, sharex=True)
+    for ax, metric in zip(axes, ('voltage', 'battery', 'load')):
+        _draw_metric(ax, metric, samples, intervals, start, end, max_gap)
+        ax.set_ylabel(f"{METRICS[metric][1]}, {METRICS[metric][2]}",
+                      color=COLORS['text'], fontsize=9)
+    _title(axes[0], f"Інвертор — {PERIOD_LABELS[period]}")
+    _time_axis(axes[-1], start, end)
+    return fig
 
 
-def create_combined_chart(hours: int = 24) -> Optional[bytes]:
-    """Create combined chart with voltage, SOC, and load"""
-    db = get_db()
-    data = db.get_status_history(hours=hours)
-
-    if not data or len(data) < 2:
-        return None
-
-    try:
-        timestamps = [row['timestamp'] for row in data]
-        voltages = [row['grid_voltage'] or 0 for row in data]
-        soc = [row['battery_soc'] or 0 for row in data]
-        load = [row['load_power'] or 0 for row in data]
-
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
-
-        # Voltage
-        ax1.plot(timestamps, voltages, 'b-', linewidth=1)
-        ax1.fill_between(timestamps, voltages, alpha=0.3)
-        ax1.set_ylabel('Напруга (V)')
-        ax1.set_title(f'Статистика за {hours} годин')
-        ax1.axhline(y=180, color='r', linestyle='--', alpha=0.5)
-        ax1.grid(True, alpha=0.3)
-
-        # Mark outages
-        for i, row in enumerate(data):
-            if not row.get('grid_available', True):
-                if i > 0:
-                    ax1.axvspan(timestamps[i-1], timestamps[i],
-                               alpha=0.3, color='red')
-
-        # SOC
-        ax2.plot(timestamps, soc, 'g-', linewidth=2)
-        ax2.fill_between(timestamps, soc, alpha=0.3, color='green')
-        ax2.set_ylabel('Батарея (%)')
-        ax2.set_ylim(0, 100)
-        ax2.axhline(y=20, color='r', linestyle='--', alpha=0.5)
-        ax2.grid(True, alpha=0.3)
-
-        # Load
-        ax3.plot(timestamps, load, 'orange', linewidth=1)
-        ax3.fill_between(timestamps, load, alpha=0.3, color='orange')
-        ax3.set_ylabel('Навант. (W)')
-        ax3.set_xlabel('Час')
-        ax3.grid(True, alpha=0.3)
-
-        ax3.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-        ax3.xaxis.set_major_locator(mdates.HourLocator(interval=max(1, hours // 12)))
-
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=100)
-        buf.seek(0)
-        plt.close(fig)
-
-        return buf.getvalue()
-
-    except Exception as e:
-        logger.error(f"Failed to create combined chart: {e}")
-        return None
+def _local_midnight(d: date) -> datetime:
+    return datetime(d.year, d.month, d.day, tzinfo=KYIV_TZ)
 
 
-def create_outage_timeline(hours: int = 24) -> Optional[bytes]:
-    """Create outage timeline visualization"""
-    db = get_db()
-    events = db.get_events(hours=hours)
+def _hours_since(t: datetime, origin: datetime) -> float:
+    return (t.timestamp() - origin.timestamp()) / 3600
 
-    grid_events = [e for e in events if e['event_type'] in ('grid_on', 'grid_off')]
 
-    if not grid_events:
-        return None
-
-    try:
-        fig, ax = plt.subplots(figsize=(10, 3))
-
-        now = datetime.now()
-        start = now - timedelta(hours=hours)
-
-        # Draw timeline
-        ax.axhline(y=0.5, color='gray', linewidth=2)
-
-        # Mark outages
-        grid_off_time = None
-
-        for event in sorted(grid_events, key=lambda x: x['timestamp']):
-            ts = event['timestamp']
-
-            if event['event_type'] == 'grid_off':
-                grid_off_time = ts
-            elif event['event_type'] == 'grid_on' and grid_off_time:
-                ax.axvspan(grid_off_time, ts, alpha=0.5, color='red')
-                grid_off_time = None
-
-        # If currently off
-        if grid_off_time:
-            ax.axvspan(grid_off_time, now, alpha=0.5, color='red')
-
-        ax.set_xlim(start, now)
+def build_timeline_figure(intervals: Sequence[Interval], start: datetime,
+                          end: datetime, period: str) -> Figure:
+    """24h: one band on a time axis. 7d/30d: one row per Kyiv day, 0..24 h"""
+    if period == '24h':
+        fig = _new_figure(10, 2.4)
+        ax = fig.add_subplot()
+        _style_axes(ax)
+        for state, a, b in state_segments(intervals, start, end):
+            x0 = mdates.date2num(a)
+            ax.broken_barh([(x0, mdates.date2num(b) - x0)], (0, 1),
+                           **_bar_style(state))
         ax.set_ylim(0, 1)
         ax.set_yticks([])
-        ax.set_xlabel('Час')
-        ax.set_title(f'Відключення мережі за {hours} годин')
+        _time_axis(ax, start, end)
+        _title(ax, f"Світло — {PERIOD_LABELS[period]}", pad=TITLE_PAD_WITH_LEGEND)
+        _state_legend(ax)
+        return fig
 
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-        ax.xaxis.set_major_locator(mdates.HourLocator(interval=max(1, hours // 6)))
+    first = start.astimezone(KYIV_TZ).date()
+    last = end.astimezone(KYIV_TZ).date()
+    days = [first + timedelta(days=i) for i in range((last - first).days + 1)]
+    fig = _new_figure(10, 0.32 * len(days) + 1.6)
+    ax = fig.add_subplot()
+    _style_axes(ax)
+    for row, day in enumerate(days):
+        lo = _local_midnight(day)
+        hi = min(_local_midnight(day + timedelta(days=1)), end)
+        if hi <= lo:
+            continue
+        for state, a, b in state_segments(intervals, lo, hi):
+            ax.broken_barh([(_hours_since(a, lo), _hours_since(b, a))],
+                           (row + 0.12, 0.76), **_bar_style(state))
+    ax.set_xlim(0, 24)
+    ax.set_xticks(range(0, 25, 3))
+    ax.set_xticklabels([f"{h:02d}:00" for h in range(0, 25, 3)])
+    ax.set_ylim(len(days), 0)
+    ax.set_yticks([i + 0.5 for i in range(len(days))])
+    ax.set_yticklabels([f"{DAYS_UA[d.weekday()]} {d:%d.%m}" for d in days])
+    ax.grid(False)
+    _title(ax, f"Світло — {PERIOD_LABELS[period]}", pad=TITLE_PAD_WITH_LEGEND)
+    _state_legend(ax)
+    return fig
 
-        plt.xticks(rotation=45)
-        plt.tight_layout()
 
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=100)
-        buf.seek(0)
-        plt.close(fig)
+def _bar_style(state: str) -> Dict:
+    if state == 'unknown':
+        return {'facecolor': 'white', 'edgecolor': COLORS['unknown'],
+                'hatch': '///', 'linewidth': 0}
+    return {'facecolor': COLORS[state], 'linewidth': 0}
 
-        return buf.getvalue()
 
-    except Exception as e:
-        logger.error(f"Failed to create outage timeline: {e}")
-        return None
+def build_heatmap_figure(rows: Sequence[HeatRow], period: str) -> Figure:
+    """Day x hour: share of time without grid (grey = mostly unknown)"""
+    fig = _new_figure(10, 0.32 * len(rows) + 1.8)
+    ax = fig.add_subplot()
+    ax.set_facecolor('white')
+    for r, row in enumerate(rows):
+        for h in range(24):
+            ax.add_patch(Rectangle((h, r), 1, 1,
+                                   facecolor=heat_color(row.off[h], row.unknown[h]),
+                                   edgecolor='white', linewidth=1))
+    ax.set_xlim(0, 24)
+    ax.set_ylim(len(rows), 0)
+    ax.set_xticks(range(0, 25, 3))
+    ax.set_xticklabels([f"{h:02d}" for h in range(0, 25, 3)])
+    ax.set_yticks([i + 0.5 for i in range(len(rows))])
+    ax.set_yticklabels([f"{DAYS_UA[r.day.weekday()]} {r.day:%d.%m}" for r in rows])
+    ax.tick_params(colors=COLORS['text'], labelsize=9, length=0)
+    for side in ax.spines.values():
+        side.set_visible(False)
+    _title(ax, f"Відключення по годинах — {PERIOD_LABELS[period]}",
+           pad=TITLE_PAD_WITH_LEGEND)
+    handles = [Patch(color=COLORS['on'], label='світло було'),
+               Patch(color='#f2c94c', label='частково'),
+               Patch(color=COLORS['off'], label='не було'),
+               Patch(color=COLORS['unknown'], label='невідомо')]
+    ax.legend(handles=handles, loc='lower left', bbox_to_anchor=(0, 1.0),
+              fontsize=8, frameon=False, ncol=4)
+    return fig

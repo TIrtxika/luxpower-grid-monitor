@@ -22,7 +22,9 @@ def kyiv_now() -> datetime:
     """Get current time in Kyiv timezone"""
     return datetime.now(KYIV_TZ)
 
-from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto,
+)
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes, MessageHandler, filters
@@ -39,7 +41,7 @@ from messages import (
     format_history_summary, format_inverter_details, format_outages,
     format_periods, format_stats, format_traffic_light, status_from_sample,
 )
-import graphs
+import charts
 
 # Logging setup
 logging.basicConfig(
@@ -52,6 +54,9 @@ logger = logging.getLogger(__name__)
 # httpx logs full Telegram URLs (with the bot token) at INFO
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# Rendered charts, shared by all chats of this process
+CHART_CACHE = charts.ChartCache()
 
 
 # =============================================================================
@@ -245,6 +250,8 @@ def _grid_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton("Тиждень", callback_data="grid_day"),
         InlineKeyboardButton("Місяць", callback_data="grid_week"),
         InlineKeyboardButton("Рік", callback_data="grid_month"),
+    ], [
+        InlineKeyboardButton("\U0001f4c8 Графік", callback_data="ch:g:timeline:24h"),
     ]])
 
 
@@ -370,57 +377,42 @@ async def cmd_full_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /chart command (private bot)"""
-    keyboard = [
-        [InlineKeyboardButton("Напруга", callback_data="chart_voltage")],
-        [InlineKeyboardButton("Батарея", callback_data="chart_battery")],
-        [InlineKeyboardButton("Навантаження", callback_data="chart_load")],
-        [InlineKeyboardButton("Все разом", callback_data="chart_combined")],
-        [InlineKeyboardButton("Відключення", callback_data="chart_outages")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
     await update.message.reply_text(
-        "Виберіть тип графіка:",
-        reply_markup=reply_markup
+        "\U0001f4c8 Оберіть графік:",
+        reply_markup=charts.keyboard('p')
     )
 
 
 async def callback_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle chart callbacks"""
+    """Chart buttons in both bots: "ch:<scope>:<type>:<period>" """
     query = update.callback_query
+    parsed = charts.parse_callback(query.data)
+    if not parsed:
+        await query.answer()
+        return
+    scope, chart_type, period = parsed
 
-    if query.from_user.id != config.OWNER_CHAT_ID:
+    if scope == 'p' and query.from_user.id != config.OWNER_CHAT_ID:
         await query.answer("Доступ заборонено", show_alert=True)
         return
 
     await query.answer("Генерую графік...")
-
-    chart_type = query.data.replace("chart_", "")
-
-    chart_funcs = {
-        "voltage": graphs.create_voltage_chart,
-        "battery": graphs.create_battery_chart,
-        "load": graphs.create_load_chart,
-        "combined": graphs.create_combined_chart,
-        "outages": graphs.create_outage_timeline
-    }
-
-    func = chart_funcs.get(chart_type)
-    if not func:
-        await query.edit_message_text("Невідомий тип графіка")
+    try:
+        png = await CHART_CACHE.get(chart_type, period)
+    except Exception as e:
+        logger.error(f"Chart {chart_type}/{period} failed: "
+                     f"{type(e).__name__}: {e}")
+        await query.message.reply_text("⚠ Не вдалося побудувати графік")
         return
 
-    chart_data = func(hours=24)
-
-    if chart_data:
-        await context.bot.send_photo(
-            chat_id=query.message.chat_id,
-            photo=chart_data,
-            caption=f"Графік за останні 24 години"
-        )
-        await query.delete_message()
+    markup = charts.keyboard(scope, chart_type, period)
+    text = charts.caption(chart_type, period)
+    if query.message.photo:
+        # Period/type switch under an existing chart: replace the picture
+        await query.edit_message_media(InputMediaPhoto(png, caption=text),
+                                       reply_markup=markup)
     else:
-        await query.edit_message_text("Недостатньо даних для графіка")
+        await query.message.reply_photo(png, caption=text, reply_markup=markup)
 
 
 @owner_only
@@ -527,6 +519,7 @@ def run_public_bot():
 
     app.add_handler(CallbackQueryHandler(callback_history_detail, pattern="^history_"))
     app.add_handler(CallbackQueryHandler(callback_grid, pattern="^grid_"))
+    app.add_handler(CallbackQueryHandler(callback_chart, pattern="^ch:"))
     app.add_handler(MessageHandler(filters.Text(list(menus.PUBLIC_BUTTONS)),
                                    on_public_button))
 
@@ -560,7 +553,7 @@ def run_private_bot():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("subscribers", cmd_subscribers))
 
-    app.add_handler(CallbackQueryHandler(callback_chart, pattern="^chart_"))
+    app.add_handler(CallbackQueryHandler(callback_chart, pattern="^ch:"))
     app.add_handler(MessageHandler(filters.Text(list(menus.PRIVATE_BUTTONS)),
                                    on_private_button))
 
