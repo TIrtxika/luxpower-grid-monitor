@@ -4,7 +4,7 @@ Run: python -m unittest test_schedule
 """
 
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from schedule import (
     DaySchedule, PlannedOutage, day_from_dict, day_to_dict, describe,
@@ -106,6 +106,11 @@ class DescribeTest(unittest.TestCase):
                          "\U0001f4c5 Сьогодні відключень за графіком більше немає; "
                          "графік на завтра ще не опубліковано")
 
+    def test_today_not_published(self):
+        d = days(today=('WaitingForSchedule', []), tomorrow=('WaitingForSchedule', []))
+        self.assertEqual(describe(d, K(2026, 10, 9, 13)),
+                         "\U0001f4c5 Графік на сьогодні ще не опубліковано")
+
     def test_emergency(self):
         d = days(today=('EmergencyShutdowns', []))
         self.assertIn("аварійні", describe(d, K(2026, 10, 9, 13)))
@@ -134,6 +139,38 @@ class RemindersTest(unittest.TestCase):
         d = days(today=('EmergencyShutdowns',
                         [(K(2026, 10, 9, 9), K(2026, 10, 9, 12, 30))]))
         self.assertEqual(due_reminders(d, K(2026, 10, 9, 8, 45), lead, set()), [])
+
+
+class DstReminderTest(unittest.TestCase):
+    """Lead time is real time, not wall-clock time, around clock changes"""
+    lead = timedelta(minutes=30)
+
+    def one(self, start):
+        return [DaySchedule(start.date(), 'ScheduleApplies',
+                            (PlannedOutage(start, start + timedelta(hours=2)),))]
+
+    def test_spring_forward(self):
+        # 29.03.2026 04:00 EEST = 01:00 UTC; 03:00 local does not exist
+        d = self.one(K(2026, 3, 29, 4))
+        now = datetime(2026, 3, 29, 0, 40, tzinfo=timezone.utc)
+        self.assertEqual(len(due_reminders(d, now, self.lead, set())), 1)
+
+    def test_fall_back(self):
+        # 25.10.2026 04:00 EET = 02:00 UTC; 90 min before is too early
+        d = self.one(K(2026, 10, 25, 4))
+        early = datetime(2026, 10, 25, 0, 45, tzinfo=timezone.utc)
+        self.assertEqual(due_reminders(d, early, self.lead, set()), [])
+        on_time = datetime(2026, 10, 25, 1, 40, tzinfo=timezone.utc)
+        self.assertEqual(len(due_reminders(d, on_time, self.lead, set())), 1)
+
+    def test_same_outage_from_db_is_not_reminded_twice(self):
+        # Repeated autumn hour: zoneinfo vs fixed-offset copies of one instant
+        start = K(2026, 10, 25, 3, 30).replace(fold=0)
+        sent = set()
+        due_reminders(self.one(start), start - timedelta(minutes=10), self.lead, sent)
+        restored = day_from_dict(day_to_dict(self.one(start)[0]))
+        self.assertEqual(due_reminders([restored], start - timedelta(minutes=5),
+                                       self.lead, sent), [])
 
 
 class PlannedSecondsTest(unittest.TestCase):

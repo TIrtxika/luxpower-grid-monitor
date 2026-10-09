@@ -4,6 +4,12 @@ VPS сервер
 """
 import os
 
+
+def _int_env(name: str, default: int) -> int:
+    """Integer from the environment; an empty value means the default"""
+    value = os.environ.get(name, "").strip()
+    return int(value) if value else default
+
 # =============================================================================
 # TELEGRAM BOTS
 # =============================================================================
@@ -96,12 +102,12 @@ YASNO_ADDRESSES_URL = os.environ.get(
     "YASNO_ADDRESSES_URL",
     "https://app.yasno.ua/api/blackout-service/public/shutdowns/addresses/v2")
 # Адреса для щотижневої перевірки групи; 0 = не перевіряти
-YASNO_STREET_ID = int(os.environ.get("YASNO_STREET_ID", "0"))
-YASNO_HOUSE_ID = int(os.environ.get("YASNO_HOUSE_ID", "0"))
+YASNO_STREET_ID = _int_env("YASNO_STREET_ID", 0)
+YASNO_HOUSE_ID = _int_env("YASNO_HOUSE_ID", 0)
 # Як часто оновлювати графік (секунди)
-SCHEDULE_REFRESH = int(os.environ.get("SCHEDULE_REFRESH", "900"))
+SCHEDULE_REFRESH = _int_env("SCHEDULE_REFRESH", 900)
 # За скільки хвилин до планового відключення нагадувати
-SCHEDULE_REMIND_MINUTES = int(os.environ.get("SCHEDULE_REMIND_MINUTES", "30"))
+SCHEDULE_REMIND_MINUTES = _int_env("SCHEDULE_REMIND_MINUTES", 30)
 
 # =============================================================================
 # LOGGING

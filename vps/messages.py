@@ -219,18 +219,21 @@ MODE_TEXT = {'all': "усі зміни", 'off_only': "лише відключе�
              'on_only': "лише повернення світла"}
 
 
-def format_settings(s) -> str:
+def format_settings(s, remind_minutes: Optional[int] = 30) -> str:
     """/settings text for subscriptions.Settings"""
     if s.quiet_enabled:
         quiet = (f"\U0001f515 Тихі години: {s.quiet_from:%H:%M}–{s.quiet_to:%H:%M} "
                  f"— сповіщення приходять беззвучно")
     else:
         quiet = "\U0001f514 Тихі години вимкнено"
-    return ("⚙️ Налаштування сповіщень\n\n"
+    text = ("⚙️ Налаштування сповіщень\n\n"
             f"{quiet}\n"
-            f"\U0001f4e3 Надсилати: {MODE_TEXT.get(s.notify_mode, s.notify_mode)}\n"
-            f"⏰ Нагадування за графіком: "
-            f"{'увімк — за 30 хв до відключення' if s.remind_enabled else 'вимк'}")
+            f"\U0001f4e3 Надсилати: {MODE_TEXT.get(s.notify_mode, s.notify_mode)}")
+    if remind_minutes is not None:
+        state = (f"увімк — за {remind_minutes} хв до відключення"
+                 if s.remind_enabled else "вимк")
+        text += f"\n⏰ Нагадування за графіком: {state}"
+    return text
 
 
 def format_battery_line(fc) -> str:

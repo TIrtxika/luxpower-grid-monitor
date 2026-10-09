@@ -3,6 +3,8 @@ ScheduleWatch: periodic schedule refresh, reminders and group check.
 Run: python -m unittest test_schedule_watch
 """
 
+import threading
+import time
 import unittest
 from datetime import date, datetime, timedelta
 
@@ -50,11 +52,15 @@ class Fetcher:
         return r
 
 
-def make(fetch, db=None, group_check=None):
+def sync(job):
+    job()
+
+
+def make(fetch, db=None, group_check=None, runner=sync):
     db = db or FakeDb()
     w = ScheduleWatch('16.1', fetch, lambda: db, refresh_s=900,
                       lead=timedelta(minutes=30), group_check=group_check,
-                      group_check_s=7 * 86400)
+                      group_check_s=7 * 86400, runner=runner)
     reminders, groups = [], []
     w.add_reminder_callback(reminders.append)
     w.add_group_callback(lambda old, new: groups.append((old, new)))
@@ -136,8 +142,44 @@ class GroupCheckTest(unittest.TestCase):
         check = Fetcher(OSError('down'))
         w, _, _, groups = make(Fetcher([TODAY]), group_check=check)
         w.tick(ts(K(9, 8)))
-        w.tick(ts(K(9, 9)))
+        w.tick(ts(K(9, 8, 5)))
         self.assertEqual((check.calls, groups), (1, []))
+        # a failed check is retried with the next refresh, not in a week
+        w.tick(ts(K(9, 8, 15)))
+        self.assertEqual(check.calls, 2)
+
+
+class RestartTest(unittest.TestCase):
+    def test_no_repeat_after_restart_inside_lead_window(self):
+        # reminder went out at 08:30, the bot restarted at 08:40
+        w, _, reminders, _ = make(Fetcher([TODAY]))
+        w.tick(ts(K(9, 8, 40)))
+        self.assertEqual(reminders, [])
+
+    def test_still_reminds_shortly_after_window_opens(self):
+        w, _, reminders, _ = make(Fetcher([TODAY]))
+        w.tick(ts(K(9, 8, 32)))
+        self.assertEqual(reminders, [TODAY.outages[0]])
+
+
+class BackgroundFetchTest(unittest.TestCase):
+    def test_slow_source_does_not_block_tick(self):
+        release = threading.Event()
+        calls = []
+
+        def slow_fetch():
+            calls.append(1)
+            release.wait(5)
+            return [TODAY]
+        w, _, _, _ = make(slow_fetch, runner=ScheduleWatch.run_in_thread)
+        started = time.monotonic()
+        w.tick(ts(K(9, 8)))
+        w.tick(ts(K(9, 8, 20)))  # refresh due, but the first is in flight
+        self.assertLess(time.monotonic() - started, 1)
+        release.set()
+        w.wait_idle(5)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(w.days(K(9, 8)), [TODAY])
 
 
 if __name__ == '__main__':

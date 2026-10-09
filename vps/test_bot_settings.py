@@ -36,6 +36,10 @@ class SettingsTextTest(unittest.TestCase):
         self.assertIn("вимкнено", text)
         self.assertIn("лише відключення", text)
 
+    def test_reminder_line_uses_lead_and_hides_without_schedule(self):
+        self.assertIn("за 45 хв", format_settings(Settings(CHAT), remind_minutes=45))
+        self.assertNotIn("Нагадування", format_settings(Settings(CHAT), remind_minutes=None))
+
     def test_reminder_line(self):
         self.assertIn("Нагадування за графіком: увімк", format_settings(Settings(CHAT)))
         self.assertIn("Нагадування за графіком: вимк",
@@ -54,6 +58,21 @@ class SettingsKeyboardTest(unittest.TestCase):
         kb = menus.settings_keyboard(Settings(CHAT, quiet_enabled=False))
         self.assertIn('set:quiet:on', callbacks(kb))
         self.assertNotIn('set:window:22-07', callbacks(kb))
+
+    def test_no_reminder_toggle_without_schedule(self):
+        kb = menus.settings_keyboard(Settings(CHAT), reminders=False)
+        self.assertNotIn('set:remind:off', callbacks(kb))
+
+    def test_bot_view_follows_config(self):
+        with patch.object(bot.config, 'DTEK_GROUP', ''):
+            text, kb = bot._settings_view(Settings(CHAT))
+        self.assertNotIn('set:remind:off', callbacks(kb))
+        self.assertNotIn("Нагадування", text)
+        with patch.object(bot.config, 'DTEK_GROUP', '16.1'), \
+             patch.object(bot.config, 'SCHEDULE_REMIND_MINUTES', 20):
+            text, kb = bot._settings_view(Settings(CHAT))
+        self.assertIn('set:remind:off', callbacks(kb))
+        self.assertIn("за 20 хв", text)
 
     def test_reminder_toggle(self):
         self.assertIn('set:remind:off', callbacks(menus.settings_keyboard(Settings(CHAT))))

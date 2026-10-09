@@ -76,7 +76,7 @@ def _mark(label: str, current: bool) -> str:
     return f"• {label}" if current else label
 
 
-def settings_keyboard(s: Settings) -> InlineKeyboardMarkup:
+def settings_keyboard(s: Settings, reminders: bool = True) -> InlineKeyboardMarkup:
     """Inline /settings menu; callback data "set:<kind>:<value>" """
     rows = []
     if s.quiet_enabled:
@@ -96,10 +96,10 @@ def settings_keyboard(s: Settings) -> InlineKeyboardMarkup:
              for mode, label in MODE_LABELS.items()]
     rows.append(modes[:2])
     rows.append(modes[2:])
-    if s.remind_enabled:
+    if reminders and s.remind_enabled:
         rows.append([InlineKeyboardButton("⏰ Нагадування за графіком: увімк",
                                           callback_data="set:remind:off")])
-    else:
+    elif reminders:
         rows.append([InlineKeyboardButton("⏰ Нагадування за графіком: вимк",
                                           callback_data="set:remind:on")])
     return InlineKeyboardMarkup(rows)

@@ -7,7 +7,7 @@ YASNO slots are minutes from local midnight (Kyiv wall clock) with type
 """
 
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import requests
@@ -113,6 +113,8 @@ def describe(days: Sequence[DaySchedule], now: datetime) -> Optional[str]:
             return f"\U0001f4c5 За графіком світла немає до {_hm(o.end)}"
         return (f"\U0001f4c5 Наступне відключення за графіком: "
                 f"{_when(o.start, now)} {_hm(o.start)}–{_hm(o.end)}")
+    if days[0].status == WAITING:
+        return "\U0001f4c5 Графік на сьогодні ще не опубліковано"
     tomorrow = days[1] if len(days) > 1 else None
     if tomorrow is None or tomorrow.status == WAITING:
         return ("\U0001f4c5 Сьогодні відключень за графіком більше немає; "
@@ -121,12 +123,22 @@ def describe(days: Sequence[DaySchedule], now: datetime) -> Optional[str]:
 
 
 def due_reminders(days: Sequence[DaySchedule], now: datetime, lead: timedelta,
-                  sent: Set[datetime]) -> List[PlannedOutage]:
-    """Outages starting within `lead` that were not reminded yet (marks them)"""
+                  sent: Set[datetime],
+                  late: Optional[timedelta] = None) -> List[PlannedOutage]:
+    """Outages starting within `lead` that were not reminded yet (marks them).
+
+    With `late`, only during the first `late` of the lead window, so a
+    restart inside the window does not repeat a reminder already sent.
+    """
     due = []
     for o in applied_outages(days):
-        if o.start - lead <= now < o.start and o.start not in sent:
-            sent.add(o.start)
+        # UTC: wall-clock arithmetic breaks around DST, and the repeated
+        # autumn hour never compares equal across zoneinfo/fixed offsets
+        start = o.start.astimezone(timezone.utc)
+        opens = start - lead
+        closes = start if late is None else min(start, opens + late)
+        if opens <= now < closes and start not in sent:
+            sent.add(start)
             due.append(o)
     return due
 

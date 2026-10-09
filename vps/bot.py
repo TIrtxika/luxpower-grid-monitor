@@ -191,8 +191,16 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if settings is None:
         await update.message.reply_text(NOT_SUBSCRIBED)
         return
-    await update.message.reply_text(format_settings(settings),
-                                    reply_markup=menus.settings_keyboard(settings))
+    text, markup = _settings_view(settings)
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+def _settings_view(settings):
+    """/settings text and keyboard; schedule reminders only with DTEK_GROUP"""
+    reminders = bool(config.DTEK_GROUP)
+    text = format_settings(
+        settings, config.SCHEDULE_REMIND_MINUTES if reminders else None)
+    return text, menus.settings_keyboard(settings, reminders=reminders)
 
 
 def _settings_change(data: str) -> Optional[dict]:
@@ -229,8 +237,8 @@ async def callback_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.update_settings(chat_id, **change)
     settings = db.get_settings(chat_id)
     await query.answer("Збережено")
-    await query.edit_message_text(format_settings(settings),
-                                  reply_markup=menus.settings_keyboard(settings))
+    text, markup = _settings_view(settings)
+    await query.edit_message_text(text, reply_markup=markup)
 
 
 @db_guarded
