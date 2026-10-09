@@ -6,7 +6,7 @@ Sends notifications to subscribers and owner
 import logging
 import asyncio
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 from zoneinfo import ZoneInfo
 
 # Kyiv timezone (EET/EEST, follows DST)
@@ -18,12 +18,40 @@ def kyiv_now() -> datetime:
     return datetime.now(KYIV_TZ)
 
 from telegram import Bot
-from telegram.error import TelegramError
+from telegram.error import Forbidden, TelegramError
 
 import config
 from database import get_db
+from grid_state import (
+    GridChange, ON,
+    REASON_RPI_UNREACHABLE, REASON_DONGLE_OFFLINE, REASON_STALE_DATA,
+    REASON_NO_GRID_DATA, REASON_MONITOR_DOWNTIME,
+)
 
 logger = logging.getLogger(__name__)
+
+SEND_OK = 'ok'
+SEND_BLOCKED = 'blocked'
+SEND_ERROR = 'error'
+
+UNKNOWN_REASONS_UA = {
+    REASON_RPI_UNREACHABLE: "RPi недоступний",
+    REASON_DONGLE_OFFLINE: "інвертор не відповідає (WiFi-донгл офлайн)",
+    REASON_STALE_DATA: "дані застарілі",
+    REASON_NO_GRID_DATA: "інвертор не повідомляє стан мережі",
+    REASON_MONITOR_DOWNTIME: "моніторинг не працював",
+}
+
+
+def format_seconds(seconds: int) -> str:
+    """'2 год 5 хв' / '5 хв 3 сек' / '40 сек'"""
+    hours, rest = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours} год {minutes} хв" if minutes else f"{hours} год"
+    if minutes:
+        return f"{minutes} хв {secs} сек" if secs else f"{minutes} хв"
+    return f"{secs} сек"
 
 
 class AlertManager:
@@ -39,25 +67,19 @@ class AlertManager:
         self._loop = loop
 
     def _format_grid_message(self, grid_on: bool, status: Dict,
-                             duration: int = None) -> str:
+                             duration: int = None,
+                             approximate: bool = False) -> str:
         """Format grid state change message"""
         if grid_on:
-            emoji = "\u26a1"  # Lightning
-            state = "УВІМКНЕНО"
-            voltage = status.get('grid', {}).get('voltage', 0)
-            msg = f"{emoji} Електромережу {state}\n"
-            msg += f"Напруга: {voltage}V"
+            voltage = (status.get('grid') or {}).get('voltage', 0)
+            msg = f"⚡ Електромережу УВІМКНЕНО\nНапруга: {voltage}V"
             if duration:
-                minutes = duration // 60
-                seconds = duration % 60
-                if minutes > 0:
-                    msg += f"\nВідключення тривало: {minutes} хв {seconds} сек"
-                else:
-                    msg += f"\nВідключення тривало: {seconds} сек"
+                msg += f"\nВідключення тривало: {format_seconds(duration)}"
         else:
-            emoji = "\u274c"  # Red X
-            state = "ВИМКНЕНО"
-            msg = f"{emoji} Електромережу {state}"
+            msg = "❌ Електромережу ВИМКНЕНО"
+
+        if approximate:
+            msg += "\n(зміна сталася, поки не було даних — час приблизний)"
 
         msg += f"\n\n{kyiv_now().strftime('%H:%M:%S %d.%m.%Y')}"
         return msg
@@ -107,40 +129,64 @@ class AlertManager:
         return msg
 
     async def _send_message_async(self, bot: Bot, chat_id: int,
-                                  text: str) -> bool:
-        """Send message asynchronously"""
+                                  text: str) -> str:
+        """Send message; returns SEND_OK / SEND_BLOCKED / SEND_ERROR"""
         try:
             await bot.send_message(chat_id=chat_id, text=text)
-            return True
+            return SEND_OK
+        except Forbidden as e:
+            logger.warning(f"Chat {chat_id} blocked the bot: {e}")
+            return SEND_BLOCKED
         except TelegramError as e:
             logger.error(f"Failed to send message to {chat_id}: {e}")
-            return False
+            return SEND_ERROR
 
     def _run_async(self, coro):
-        """Run coroutine in event loop"""
-        if self._loop is None:
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-
-        if self._loop.is_running():
-            asyncio.ensure_future(coro, loop=self._loop)
+        """Run coroutine on the bot's event loop (called from poller thread)"""
+        if self._loop is not None and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(coro, self._loop)
         else:
-            self._loop.run_until_complete(coro)
+            logger.warning("Bot event loop not running, sending synchronously")
+            asyncio.run(coro)
 
-    async def send_grid_alert(self, grid_on: bool, status: Dict,
-                              duration: int = None):
-        """Send grid state change alert to all subscribers"""
-        message = self._format_grid_message(grid_on, status, duration)
-
-        # Get subscribers
+    async def send_grid_alert(self, change: GridChange, status: Optional[Dict]):
+        """Save the event, then notify subscribers, channel and owner"""
+        status = status or {}
+        grid_on = change.state == ON
         db = get_db()
-        subscribers = db.get_active_subscribers()
+
+        try:
+            db.save_event(
+                'grid_on' if grid_on else 'grid_off',
+                {
+                    'voltage': (status.get('grid') or {}).get('voltage'),
+                    'duration_seconds': change.duration_s,
+                    'approximate': change.approximate,
+                }
+            )
+        except Exception as e:
+            logger.error(f"Failed to save grid event: {e}")
+
+        message = self._format_grid_message(grid_on, status, change.duration_s,
+                                            change.approximate)
+
+        try:
+            subscribers = db.get_active_subscribers()
+        except Exception as e:
+            logger.error(f"Failed to load subscribers: {e}")
+            subscribers = []
 
         logger.info(f"Sending grid alert to {len(subscribers)} subscribers")
 
-        # Send to all subscribers
         for chat_id in subscribers:
-            await self._send_message_async(self.public_bot, chat_id, message)
+            result = await self._send_message_async(self.public_bot, chat_id,
+                                                     message)
+            if result == SEND_BLOCKED:
+                try:
+                    db.remove_subscriber(chat_id)
+                    logger.info(f"Deactivated subscriber {chat_id}")
+                except Exception as e:
+                    logger.error(f"Failed to deactivate {chat_id}: {e}")
 
         # Send to public channel if configured
         if config.PUBLIC_CHANNEL_ID:
@@ -150,69 +196,42 @@ class AlertManager:
             except ValueError:
                 pass
 
-        # Also send detailed status to owner via private bot
-        if self.private_bot and config.OWNER_CHAT_ID:
-            private_msg = self._format_private_status(status)
+        # Detailed status to owner via private bot
+        if self.private_bot and config.OWNER_CHAT_ID and status:
             await self._send_message_async(
-                self.private_bot, config.OWNER_CHAT_ID, private_msg
+                self.private_bot, config.OWNER_CHAT_ID,
+                self._format_private_status(status)
             )
 
-        # Log event to database
-        db.save_event(
-            'grid_on' if grid_on else 'grid_off',
-            {
-                'voltage': status.get('grid', {}).get('voltage'),
-                'duration_seconds': duration
-            }
-        )
+    def on_grid_change(self, change: GridChange, status: Optional[Dict]):
+        """Poller callback: grid ON <-> OFF"""
+        self._run_async(self.send_grid_alert(change, status))
 
-    def on_grid_state_change(self, old_state: bool, new_state: bool,
-                             status: Dict):
-        """Callback for grid state changes from poller"""
-        # Calculate duration if grid came back
-        duration = None
-        if new_state:  # Grid ON
-            db = get_db()
-            events = db.get_events('grid_off', hours=24, limit=1)
-            if events:
-                last_off = events[0]
-                off_time = last_off['timestamp'].timestamp()
-                duration = int(status.get('timestamp', 0) - off_time)
+    def on_unknown_change(self, active: bool, reason: Optional[str],
+                          seconds: int):
+        """Poller callback: unknown state alert / data restored / downtime"""
+        self._run_async(self._send_unknown_alert(active, reason, seconds))
 
-        # Send alert
-        self._run_async(self.send_grid_alert(new_state, status, duration))
-
-    def on_rpi_state_change(self, available: bool, detail: int):
-        """Callback for RPi availability changes from poller.
-
-        Args:
-            available: True if RPi recovered, False if became unreachable
-            detail: consecutive failures count (when unavailable) or
-                    downtime in seconds (when recovered)
-        """
-        self._run_async(self._send_rpi_alert(available, detail))
-
-    async def _send_rpi_alert(self, available: bool, detail: int):
-        """Send RPi availability alert to owner"""
-        bot = self.private_bot or self.public_bot
+    async def _send_unknown_alert(self, active: bool, reason: Optional[str],
+                                  seconds: int):
+        """Unknown-state alerts go to the owner only"""
         if not config.OWNER_CHAT_ID:
             return
-
+        bot = self.private_bot or self.public_bot
         now = kyiv_now().strftime('%H:%M:%S %d.%m.%Y')
+        duration = format_seconds(seconds)
 
-        if available:
-            minutes = detail // 60
-            seconds = detail % 60
-            if minutes > 0:
-                duration_str = f"{minutes} хв {seconds} сек"
-            else:
-                duration_str = f"{seconds} сек"
-            msg = (f"\u2705 RPi знову доступний\n"
-                   f"Був недоступний: {duration_str}\n\n{now}")
+        if active:
+            reason_text = UNKNOWN_REASONS_UA.get(reason, reason or "невідомо")
+            msg = (f"\U0001f7e1 Немає даних про мережу\n"
+                   f"Причина: {reason_text}\n"
+                   f"Вже {duration}\n\n{now}")
+        elif reason == REASON_MONITOR_DOWNTIME:
+            msg = (f"⚠️ Моніторинг не працював {duration}\n"
+                   f"Стан мережі за цей час невідомий\n\n{now}")
         else:
-            msg = (f"\u26a0\ufe0f RPi недоступний!\n"
-                   f"Помилок підряд: {detail}\n"
-                   f"Дані можуть бути застарілими\n\n{now}")
+            msg = (f"✅ Дані знову надходять\n"
+                   f"Не було даних: {duration}\n\n{now}")
 
         await self._send_message_async(bot, config.OWNER_CHAT_ID, msg)
 
