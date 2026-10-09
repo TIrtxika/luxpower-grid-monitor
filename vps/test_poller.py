@@ -290,8 +290,8 @@ class PollerTest(unittest.TestCase):
 
     def test_schedule_watch_built_from_config(self):
         with patch.object(poller_mod.config, 'DTEK_GROUP', '16.1'), \
-             patch.object(poller_mod.config, 'YASNO_STREET_ID', 1624), \
-             patch.object(poller_mod.config, 'YASNO_HOUSE_ID', 32079):
+             patch.object(poller_mod.config, 'YASNO_STREET', 'Руданського'), \
+             patch.object(poller_mod.config, 'YASNO_HOUSE', '3А'):
             watch = RpiPoller(db_factory=FakeDb).schedule
         self.assertEqual(watch.group, '16.1')
         self.assertIsNotNone(watch._group_check)

@@ -206,14 +206,46 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(len(days), 2)
         self.assertEqual(session.calls[0][1]['timeout'], 10)
 
-    def test_fetch_group(self):
-        session = FakeSession({'group': 16, 'subgroup': 1})
-        self.assertEqual(fetch_group('https://x/addresses/v2', 1624, 32079,
+    def test_fetch_group_resolves_ids_by_name(self):
+        # YASNO re-numbers its address directory: ids are looked up every time
+        session = RoutingSession({
+            'streets': [{'id': 1613, 'value': 'вул. Руданського Степана'}],
+            'houses': [{'id': 31902, 'value': '3'}, {'id': 31903, 'value': '3А'},
+                       {'id': 31904, 'value': '3Б'}],
+            'group': {'group': 16, 'subgroup': 1},
+        })
+        self.assertEqual(fetch_group('https://x/addresses/v2', 'Руданського', '3а',
                                      session=session), '16.1')
-        url, kwargs = session.calls[0]
-        self.assertEqual(url, 'https://x/addresses/v2/group')
-        self.assertEqual(kwargs['params'], {'regionId': 25, 'dsoId': 902,
-                                            'streetId': 1624, 'houseId': 32079})
+        params = {path: kw['params'] for path, kw in session.calls}
+        self.assertEqual(params['streets']['query'], 'Руданського')
+        self.assertEqual(params['houses']['streetId'], 1613)
+        self.assertEqual(params['group'], {'regionId': 25, 'dsoId': 902,
+                                           'streetId': 1613, 'houseId': 31903})
+
+    def test_fetch_group_unknown_address(self):
+        session = RoutingSession({'streets': [], 'houses': [], 'group': {}})
+        with self.assertRaisesRegex(LookupError, "street not found"):
+            fetch_group('https://x/addresses/v2', 'Нема', '1', session=session)
+        session = RoutingSession({'streets': [{'id': 1, 'value': 'вул. А'}],
+                                  'houses': [{'id': 2, 'value': '3Б'}], 'group': {}})
+        with self.assertRaisesRegex(LookupError, "house not found"):
+            fetch_group('https://x/addresses/v2', 'А', '3А', session=session)
+
+
+class RoutingSession(FakeSession):
+    """Answers by the last path segment of the URL"""
+    def get(self, url, **kwargs):
+        path = url.rsplit('/', 1)[1]
+        self.calls.append((path, kwargs))
+        payload = self.payload[path]
+
+        class Response:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return payload
+        return Response()
 
 
 if __name__ == '__main__':

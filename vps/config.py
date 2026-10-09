@@ -101,9 +101,10 @@ YASNO_SCHEDULE_URL = os.environ.get(
 YASNO_ADDRESSES_URL = os.environ.get(
     "YASNO_ADDRESSES_URL",
     "https://app.yasno.ua/api/blackout-service/public/shutdowns/addresses/v2")
-# Адреса для щотижневої перевірки групи; 0 = не перевіряти
-YASNO_STREET_ID = _int_env("YASNO_STREET_ID", 0)
-YASNO_HOUSE_ID = _int_env("YASNO_HOUSE_ID", 0)
+# Адреса для щотижневої перевірки групи (назва вулиці, номер будинку);
+# порожні = не перевіряти. ID у довіднику YASNO змінюються, тому шукаємо за назвою
+YASNO_STREET = os.environ.get("YASNO_STREET", "").strip()
+YASNO_HOUSE = os.environ.get("YASNO_HOUSE", "").strip()
 # Як часто оновлювати графік (секунди)
 SCHEDULE_REFRESH = _int_env("SCHEDULE_REFRESH", 900)
 # За скільки хвилин до планового відключення нагадувати
