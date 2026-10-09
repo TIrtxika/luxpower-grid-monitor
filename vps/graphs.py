@@ -5,8 +5,14 @@ Object-oriented matplotlib (thread-safe, no pyplot), Kyiv time on the axes
 
 import io
 import math
+import os
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+
+# Fixed app-owned matplotlib cache; otherwise every start creates a new
+# temp dir in the working directory (the home of the bot user is not writable)
+os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parent / ".mplconfig"))
 
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend

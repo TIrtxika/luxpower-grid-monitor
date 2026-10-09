@@ -34,9 +34,13 @@ class FakeDb:
         self.saved = []
         self.cleanups = []
         self.fail_switch = 0
+        self.fail_init = 0
         self.heartbeat_rows = 1
 
     def recover_gap(self, now, max_gap):
+        if self.fail_init:
+            self.fail_init -= 1
+            raise RuntimeError("db down at startup")
         return self.gap
 
     def get_open_interval(self):
@@ -54,11 +58,14 @@ class FakeDb:
             self.fail_switch -= 1
             raise RuntimeError("db down")
         closed = None
+        boundary = at
         if self.open_iv:
+            # Like the real DB: the boundary never precedes the open interval start
+            boundary = max(at, self.open_iv['started_at'])
             closed = {'state': self.open_iv['state'],
-                      'started_at': self.open_iv['started_at'], 'ended_at': at}
+                      'started_at': self.open_iv['started_at'], 'ended_at': boundary}
         self.switches.append((state, at))
-        self.open_iv = {'state': state, 'started_at': at, 'last_seen_at': now}
+        self.open_iv = {'state': state, 'started_at': boundary, 'last_seen_at': now}
         return closed
 
     def save_status(self, status):
@@ -237,6 +244,29 @@ class PollerTest(unittest.TestCase):
              self.assertLogs('poller', level='WARNING') as logs:
             h.poll(0, st(True))
         self.assertNotIn(HC_URL, "\n".join(logs.output))
+
+    def test_outage_duration_never_negative_after_clock_step(self):
+        # the off interval in the DB starts after the boundary the tracker reports
+        h = Harness(seeded('off', started=500))
+        for t in (0, 60, 120):
+            h.poll(t, st(True))
+        self.assertEqual(h.changes[0].duration_s, 0)
+
+    def test_init_retried_when_db_was_down_at_startup(self):
+        db = FakeDb(open_iv={'state': 'unknown', 'started_at': dt(-3600),
+                             'last_seen_at': dt(-3600)},
+                    last_known='on', gap=(dt(-3600), dt(0)))
+        db.fail_init = 1
+        h = Harness(db)
+        self.assertEqual(h.unknown, [])
+        h.poll(60, st(True))
+        self.assertEqual(h.unknown, [(False, 'monitor_downtime', 3600)])
+
+    def test_state_since_in_memory(self):
+        h = Harness(seeded('on'))
+        for t in (0, 60, 120):
+            h.poll(t, st(False))
+        self.assertEqual(h.poller.get_state_since(), dt(0))
 
     def test_empty_db_first_poll_opens_interval_without_alert(self):
         h = Harness(FakeDb())

@@ -51,6 +51,7 @@ class RpiPoller:
 
         self.tracker = self._new_tracker()
         self._unsaved: List[Transition] = []
+        self._initialized = False  # init_state succeeded (DB reachable)
         self._unknown_alerted = False
         self._unknown_since: float = 0       # start of the unknown period
         self._unknown_alert_from: float = 0  # 🟡 alert threshold counts from here
@@ -147,8 +148,10 @@ class RpiPoller:
             open_iv = db.get_open_interval()
             last_known = db.get_last_known_state()
         except Exception as e:
+            # Retried on the next poll, so downtime is still recorded later
             logger.error(f"Failed to load grid state from DB: {e}")
             return
+        self._initialized = True
 
         if open_iv:
             self.tracker = self._new_tracker(
@@ -225,7 +228,9 @@ class RpiPoller:
 
         duration = None
         if t.state == ON and closed and closed['state'] == OFF:
-            duration = int(t.at - closed['started_at'].timestamp())
+            # Use the boundary the DB recorded (it may clamp after a clock step)
+            duration = max(0, int(closed['ended_at'].timestamp()
+                                  - closed['started_at'].timestamp()))
 
         change = GridChange(state=t.state, at=t.at, duration_s=duration,
                             approximate=(t.previous == UNKNOWN))
@@ -264,6 +269,8 @@ class RpiPoller:
 
     def _poll_once(self):
         """Single poll iteration"""
+        if not self._initialized:
+            self.init_state()
         now = self._clock()
         status = self.fetch_status()
         if status is not None:
@@ -360,6 +367,12 @@ class RpiPoller:
     def get_effective_state(self) -> Optional[str]:
         """'on' / 'off' / 'unknown', or None before the first poll"""
         return self.tracker.state
+
+    def get_state_since(self) -> Optional[datetime]:
+        """Start of the current effective state (in memory, not the DB)"""
+        if self.tracker.state is None:
+            return None
+        return _dt(self.tracker.since)
 
     def get_state_reason(self) -> Optional[str]:
         """Why the state is unknown (None otherwise)"""
