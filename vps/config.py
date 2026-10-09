@@ -61,6 +61,15 @@ RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
 PUBLIC_CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL_ID", "")
 
 # =============================================================================
+# NTFY — сповіщення власнику поза Telegram
+# =============================================================================
+NTFY_URL = os.environ.get("NTFY_URL", "https://ntfy.sh")
+# Секретний топік; порожній = ntfy вимкнено
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
+# Токен доступу (опціонально, для захищених топіків/self-hosted)
+NTFY_TOKEN = os.environ.get("NTFY_TOKEN", "")
+
+# =============================================================================
 # LOGGING
 # =============================================================================
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
