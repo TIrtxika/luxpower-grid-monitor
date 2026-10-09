@@ -166,14 +166,29 @@ def _empty_note(ax, text: str = "Немає даних за цей період"
             color=COLORS['text'], fontsize=12, alpha=0.7)
 
 
-def _state_legend(ax):
+def _state_legend(ax, plan: bool = False):
     """Legend in the band between the title and the plot"""
     handles = [Patch(color=COLORS['on'], label='є світло'),
                Patch(color=COLORS['off'], label='немає'),
                Patch(facecolor='white', edgecolor=COLORS['unknown'], hatch='///',
                      label='невідомо')]
+    if plan:
+        handles.append(Patch(**_PLAN_STYLE, label='за графіком'))
     ax.legend(handles=handles, loc='lower left', bbox_to_anchor=(0, 1.0),
-              fontsize=8, frameon=False, ncol=3, borderaxespad=0.2)
+              fontsize=8, frameon=False, ncol=len(handles), borderaxespad=0.2)
+
+
+# Planned outages (DTEK schedule): a thin hatched lane under the fact band
+_PLAN_STYLE = {'facecolor': 'white', 'edgecolor': COLORS['off'],
+               'hatch': '\\\\\\', 'linewidth': 0.6}
+
+
+def _clip(planned, lo: datetime, hi: datetime):
+    """(start, end) of planned outages inside [lo, hi)"""
+    for o in planned:
+        a, b = max(o.start, lo), min(o.end, hi)
+        if b > a:
+            yield a, b
 
 
 def _draw_metric(ax, metric: str, samples: Sequence[Dict],
@@ -230,21 +245,33 @@ def _hours_since(t: datetime, origin: datetime) -> float:
 
 
 def build_timeline_figure(intervals: Sequence[Interval], start: datetime,
-                          end: datetime, period: str) -> Figure:
-    """24h: one band on a time axis. 7d/30d: one row per Kyiv day, 0..24 h"""
+                          end: datetime, period: str,
+                          planned: Optional[Sequence] = None) -> Figure:
+    """24h: one band on a time axis. 7d/30d: one row per Kyiv day, 0..24 h.
+
+    `planned` (schedule.PlannedOutage list) adds a lane of planned outages;
+    day rows show the whole day's plan, including hours still ahead.
+    """
+    plan = planned is not None
     if period == '24h':
         fig = _new_figure(10, 2.4)
         ax = fig.add_subplot()
         _style_axes(ax)
+        band = (0.3, 0.7) if plan else (0, 1)
         for state, a, b in state_segments(intervals, start, end):
             x0 = mdates.date2num(a)
-            ax.broken_barh([(x0, mdates.date2num(b) - x0)], (0, 1),
+            ax.broken_barh([(x0, mdates.date2num(b) - x0)], band,
                            **_bar_style(state))
+        if plan:
+            bars = [(mdates.date2num(a), mdates.date2num(b) - mdates.date2num(a))
+                    for a, b in _clip(planned, start, end)]
+            if bars:
+                ax.broken_barh(bars, (0.04, 0.18), gid='plan', **_PLAN_STYLE)
         ax.set_ylim(0, 1)
         ax.set_yticks([])
         _time_axis(ax, start, end)
         _title(ax, f"Світло — {PERIOD_LABELS[period]}", pad=TITLE_PAD_WITH_LEGEND)
-        _state_legend(ax)
+        _state_legend(ax, plan)
         return fig
 
     first = start.astimezone(KYIV_TZ).date()
@@ -253,14 +280,21 @@ def build_timeline_figure(intervals: Sequence[Interval], start: datetime,
     fig = _new_figure(10, 0.32 * len(days) + 1.6)
     ax = fig.add_subplot()
     _style_axes(ax)
+    band = (0.08, 0.6) if plan else (0.12, 0.76)
     for row, day in enumerate(days):
         lo = _local_midnight(day)
-        hi = min(_local_midnight(day + timedelta(days=1)), end)
+        day_end = _local_midnight(day + timedelta(days=1))
+        hi = min(day_end, end)
+        if plan:
+            bars = [(_hours_since(a, lo), _hours_since(b, a))
+                    for a, b in _clip(planned, lo, day_end)]
+            if bars:
+                ax.broken_barh(bars, (row + 0.74, 0.18), gid='plan', **_PLAN_STYLE)
         if hi <= lo:
             continue
         for state, a, b in state_segments(intervals, lo, hi):
             ax.broken_barh([(_hours_since(a, lo), _hours_since(b, a))],
-                           (row + 0.12, 0.76), **_bar_style(state))
+                           (row + band[0], band[1]), **_bar_style(state))
     ax.set_xlim(0, 24)
     ax.set_xticks(range(0, 25, 3))
     ax.set_xticklabels([f"{h:02d}:00" for h in range(0, 25, 3)])
@@ -269,7 +303,7 @@ def build_timeline_figure(intervals: Sequence[Interval], start: datetime,
     ax.set_yticklabels([f"{DAYS_UA[d.weekday()]} {d:%d.%m}" for d in days])
     ax.grid(False)
     _title(ax, f"Світло — {PERIOD_LABELS[period]}", pad=TITLE_PAD_WITH_LEGEND)
-    _state_legend(ax)
+    _state_legend(ax, plan)
     return fig
 
 

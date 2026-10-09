@@ -340,10 +340,18 @@ class AlertManager:
                                  and not (skip_owner and s.chat_id == owner)],
                             message)
 
+        # The owner's own /settings (public bot) apply; defaults if not subscribed
+        mine = next((s for s in subscribers if s.chat_id == owner),
+                    Settings(owner))
+        if not mine.remind_enabled:
+            return
+        quiet = in_quiet_hours(mine, kyiv_now())
         if skip_owner:
-            await self._send_message_async(self.private_bot, owner, message)
+            await self._send_message_async(self.private_bot, owner, message,
+                                           silent=quiet)
         await self._notify_owner_channels(
-            Notice(title, body, PRIORITY_DEFAULT, ('calendar',)))
+            Notice(title, body, PRIORITY_LOW if quiet else PRIORITY_DEFAULT,
+                   ('calendar',)))
 
     async def _send_group_change(self, configured: str, actual: str):
         """The address now belongs to another schedule group: owner only"""

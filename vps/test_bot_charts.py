@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import bot
+from telegram.error import BadRequest
 
 
 def chart_query(data, user_id=None, photo=False):
@@ -41,6 +42,19 @@ class ChartCallbackTest(unittest.TestCase):
         self.run_cb(update)
         query.edit_message_media.assert_awaited_once()
         query.message.reply_photo.assert_not_awaited()
+
+    def test_pressing_the_current_chart_again_is_not_an_error(self):
+        update, query = chart_query('ch:p:voltage:7d', photo=True)
+        query.edit_message_media.side_effect = BadRequest(
+            "Message is not modified: specified new message content and reply "
+            "markup are exactly the same as a current content")
+        self.run_cb(update)  # must not raise
+
+    def test_other_edit_errors_still_raise(self):
+        update, query = chart_query('ch:p:voltage:7d', photo=True)
+        query.edit_message_media.side_effect = BadRequest("Message to edit not found")
+        with self.assertRaises(BadRequest):
+            self.run_cb(update)
 
     def test_private_chart_denied_for_others(self):
         update, query = chart_query('ch:p:voltage:24h', user_id=bot.config.OWNER_CHAT_ID + 1)

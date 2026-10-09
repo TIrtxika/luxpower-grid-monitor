@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 import psycopg2
 import requests
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 
 # Kyiv timezone (EET/EEST, follows DST)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -546,8 +546,13 @@ async def callback_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = charts.caption(chart_type, period)
     if query.message.photo:
         # Period/type switch under an existing chart: replace the picture
-        await query.edit_message_media(InputMediaPhoto(png, caption=text),
-                                       reply_markup=markup)
+        try:
+            await query.edit_message_media(InputMediaPhoto(png, caption=text),
+                                           reply_markup=markup)
+        except BadRequest as e:
+            # The button of the chart already shown: nothing to change
+            if "not modified" not in str(e).lower():
+                raise
     else:
         await query.message.reply_photo(png, caption=text, reply_markup=markup)
 

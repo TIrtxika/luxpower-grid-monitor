@@ -93,13 +93,42 @@ fi
 journal_args=()
 for unit in $UNITS; do journal_args+=(-u "$unit"); done
 logs="$(journalctl "${journal_args[@]}" --since "$since" --no-pager -o cat)"
-count() { grep -c -- "$1" <<<"$logs" || true; }
-tracebacks="$(count 'Traceback')"
-errors="$(count '\[ERROR\]')"
-tokens="$(count 'api.telegram.org/bot')"
+# Per log record (a line starting with a timestamp plus its continuation
+# lines): a traceback is the app's if one of its frames is a top-level
+# module in $APP_DIR; tracebacks only through the venv/stdlib (e.g. a
+# transient httpx.ReadError) and [ERROR]s of library loggers are warnings.
+read -r tracebacks errors tokens lib_tracebacks lib_errors < <(
+    awk -v frame="File \"$APP_DIR/" '
+    function flush() {
+        if (has_tb) { if (app_frame) tb++; else lib_tb++ }
+        else if (is_error) { if (lib_logger) lib_err++; else err++ }
+        has_tb = app_frame = is_error = lib_logger = 0
+    }
+    /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] / {
+        flush()
+        if ($0 ~ /\[ERROR\]/) {
+            is_error = 1
+            lib_logger = ($0 ~ /\[ERROR\] (telegram|httpx|httpcore|apscheduler|urllib3)[.:]/)
+        }
+    }
+    /Traceback \(most recent call last\)/ { has_tb = 1 }
+    {
+        i = index($0, frame)
+        if (i) {
+            rest = substr($0, i + length(frame))
+            if (rest ~ /^[^\/"]+\.py"/) app_frame = 1
+        }
+        if ($0 ~ /api\.telegram\.org\/bot/) tok++
+    }
+    END { flush(); print tb + 0, err + 0, tok + 0, lib_tb + 0, lib_err + 0 }
+    ' <<<"$logs")
 
 echo "deployed $commit (${#files[@]} files), backup: $backup"
-echo "since $since: tracebacks=$tracebacks errors=$errors token_urls=$tokens"
+echo "since $since: tracebacks=$tracebacks errors=$errors token_urls=$tokens" \
+     "library_tracebacks=$lib_tracebacks library_errors=$lib_errors"
+if (( lib_tracebacks + lib_errors > 0 )); then
+    echo "warning: library-only errors in the logs (network?), app code not involved" >&2
+fi
 if (( tracebacks + errors + tokens > 0 )); then
     echo "problems in the logs — $rollback" >&2
     exit 1
