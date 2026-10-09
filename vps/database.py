@@ -9,11 +9,13 @@ from typing import Optional, List, Dict, Any, Tuple
 from contextlib import contextmanager
 
 import psycopg2
+from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 
 import config
 from stats import Interval
+from subscriptions import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +115,20 @@ class Database:
                         subscribed_at TIMESTAMPTZ DEFAULT NOW(),
                         is_active BOOLEAN DEFAULT TRUE
                     );
+                """)
+
+                # Налаштування сповіщень підписника (тихі години, режим)
+                cur.execute("""
+                    ALTER TABLE subscribers
+                        ADD COLUMN IF NOT EXISTS quiet_enabled BOOLEAN
+                            NOT NULL DEFAULT TRUE,
+                        ADD COLUMN IF NOT EXISTS quiet_from TIME
+                            NOT NULL DEFAULT '23:00',
+                        ADD COLUMN IF NOT EXISTS quiet_to TIME
+                            NOT NULL DEFAULT '07:00',
+                        ADD COLUMN IF NOT EXISTS notify_mode TEXT
+                            NOT NULL DEFAULT 'all'
+                            CHECK (notify_mode IN ('all', 'off_only', 'on_only'));
                 """)
 
                 # Таблиця інтервалів стану мережі
@@ -460,6 +476,52 @@ class Database:
                     WHERE is_active = TRUE
                 """)
                 return [row[0] for row in cur.fetchall()]
+
+    _SETTINGS_FIELDS = ('quiet_enabled', 'quiet_from', 'quiet_to', 'notify_mode')
+
+    def _settings_from_row(self, row) -> Settings:
+        return Settings(chat_id=row['chat_id'], quiet_enabled=row['quiet_enabled'],
+                        quiet_from=row['quiet_from'], quiet_to=row['quiet_to'],
+                        notify_mode=row['notify_mode'])
+
+    def get_settings(self, chat_id: int) -> Optional[Settings]:
+        """Notification settings of an active subscriber"""
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT chat_id, quiet_enabled, quiet_from, quiet_to, notify_mode
+                    FROM subscribers
+                    WHERE chat_id = %s AND is_active = TRUE
+                """, (chat_id,))
+                row = cur.fetchone()
+                return self._settings_from_row(row) if row else None
+
+    def get_subscriber_settings(self) -> List[Settings]:
+        """Settings of all active subscribers (alert fan-out)"""
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT chat_id, quiet_enabled, quiet_from, quiet_to, notify_mode
+                    FROM subscribers
+                    WHERE is_active = TRUE
+                    ORDER BY id
+                """)
+                return [self._settings_from_row(r) for r in cur.fetchall()]
+
+    def update_settings(self, chat_id: int, **fields) -> bool:
+        """Change notification settings; only known fields are accepted"""
+        unknown = set(fields) - set(self._SETTINGS_FIELDS)
+        if unknown or not fields:
+            raise ValueError(f"Unknown settings fields: {sorted(unknown)}")
+        assignments = sql.SQL(", ").join(
+            sql.SQL("{} = %s").format(sql.Identifier(name)) for name in fields)
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("UPDATE subscribers SET {} WHERE chat_id = %s").format(
+                        assignments),
+                    (*fields.values(), chat_id))
+                return cur.rowcount > 0
 
     def is_subscribed(self, chat_id: int) -> bool:
         """Check if chat is subscribed"""
