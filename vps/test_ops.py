@@ -23,6 +23,22 @@ def run(script, env, args=()):
                           capture_output=True, text=True, timeout=60)
 
 
+class RootPathsTest(unittest.TestCase):
+    """Root runs these scripts: they must live outside the bot user's tree"""
+
+    def test_backup_unit_runs_script_from_root_owned_path(self):
+        unit = (OPS.parent / 'systemd' / 'luxpower-db-backup.service').read_text()
+        (exec_line,) = [l for l in unit.splitlines() if l.startswith('ExecStart=')]
+        self.assertTrue(exec_line.startswith('ExecStart=/usr/local/sbin/'), exec_line)
+        self.assertNotIn('/opt/luxpower', exec_line)
+
+    def test_readme_installs_ops_scripts_to_root_owned_path(self):
+        readme = (OPS.parent.parent / 'README.md').read_text()
+        self.assertNotIn('/opt/luxpower/ops', readme)
+        self.assertIn('/usr/local/sbin/luxpower-deploy', readme)
+        self.assertIn('/usr/local/sbin/luxpower-backup-db', readme)
+
+
 class BackupTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -182,6 +198,29 @@ class DeployTest(unittest.TestCase):
         result = self.deploy()
         self.assertEqual(result.returncode, 1)
         self.assertIn('rollback', result.stderr)
+
+    def test_does_not_run_app_owned_interpreter(self):
+        # deploy runs as root; the app venv is writable by the bot user
+        marker = Path(self.tmp.name) / 'pwned'
+        venv_python = self.app / 'venv' / 'bin' / 'python3'
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        venv_python.chmod(0o755)
+        del self.env['PYTHON']
+        result = self.deploy()
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertFalse(marker.exists())
+
+    def test_symlinked_app_file_is_replaced_not_followed(self):
+        outside = Path(self.tmp.name) / 'outside.txt'
+        outside.write_text("system file\n")
+        (self.app / 'bot.py').unlink()
+        (self.app / 'bot.py').symlink_to(outside)
+        result = self.deploy()
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(outside.read_text(), "system file\n")
+        self.assertFalse((self.app / 'bot.py').is_symlink())
+        self.assertEqual((self.app / 'bot.py').read_text(), "print('new bot')\n")
 
     def test_bad_commit_argument(self):
         result = run('deploy.sh', self.env, ('main; rm -rf /',))

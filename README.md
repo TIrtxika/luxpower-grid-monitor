@@ -166,7 +166,7 @@ On the dev machine, make a checksum manifest of the commit to deploy:
 
 Copy the manifest to the VPS and run:
 
-    sudo /opt/luxpower/ops/deploy.sh <commit> /tmp/manifest.sha256
+    sudo /usr/local/sbin/luxpower-deploy <commit> /tmp/manifest.sha256
 
 The script downloads the commit from GitHub, refuses to deploy if any file does not
 match the manifest, compiles the code, backs up `/opt/luxpower` code to
@@ -180,7 +180,9 @@ bot-token URLs in the logs.
 (`Persistent=true` catches up after downtime): gzipped `pg_dump` into
 `/var/backups/luxpower/daily/` (mode 600), newest 14 kept.
 
-    sudo install -o root -g root -m 755 vps/ops/*.sh /opt/luxpower/ops/
+    # root-owned location: never under /opt/luxpower, which the bot user owns
+    sudo install -o root -g root -m 755 vps/ops/backup-db.sh /usr/local/sbin/luxpower-backup-db
+    sudo install -o root -g root -m 755 vps/ops/deploy.sh /usr/local/sbin/luxpower-deploy
     sudo cp vps/systemd/luxpower-db-backup.* /etc/systemd/system/
     sudo systemctl daemon-reload && sudo systemctl enable --now luxpower-db-backup.timer
 

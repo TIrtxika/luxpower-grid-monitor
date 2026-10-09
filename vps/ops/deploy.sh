@@ -14,7 +14,9 @@ APP_DIR="${APP_DIR:-/opt/luxpower}"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/luxpower}"
 UNITS="${UNITS:-luxpower-bot-public luxpower-bot-private}"
 INSTALL_OPTS="${INSTALL_OPTS--o luxpower -g luxpower}"
-PYTHON="${PYTHON:-$APP_DIR/venv/bin/python3}"
+# Runs as root: never execute anything the bot user can write (its venv).
+# The root-owned system interpreter is enough for a syntax check.
+PYTHON="${PYTHON:-/usr/bin/python3}"
 SHA256="${SHA256:-sha256sum}"
 SETTLE_SECONDS="${SETTLE_SECONDS:-15}"
 SOURCE_TGZ="${SOURCE_TGZ:-}"   # tests: a local tarball instead of GitHub
