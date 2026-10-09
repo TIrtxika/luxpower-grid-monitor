@@ -187,11 +187,50 @@ class DeployTest(unittest.TestCase):
         self.assertEqual((self.app / 'bot.py').read_text(), "print('old bot')\n")
         self.assertEqual(self.systemctl_calls(), [])
 
-    def test_errors_in_logs_fail_with_rollback_hint(self):
-        self.journal.write_text("Traceback (most recent call last):\n[ERROR] boom\n")
+    def app_traceback(self, frame_path):
+        return (
+            "2026-10-09 18:51:29,893 [ERROR] telegram.ext.Application: "
+            "No error handlers are registered, logging exception.\n"
+            "Traceback (most recent call last):\n"
+            f'  File "{self.app}/venv/lib/python3.11/site-packages/telegram/ext/x.py",'
+            " line 1, in handle\n"
+            f'  File "{frame_path}", line 412, in callback_chart\n'
+            "    await query.edit_message_media(...)\n"
+            "telegram.error.BadRequest: Message is not modified\n"
+            "2026-10-09 18:51:30,000 [INFO] bot: ok\n")
+
+    def test_app_traceback_fails_with_rollback_hint(self):
+        self.journal.write_text(self.app_traceback(f"{self.app}/bot.py"))
         result = self.deploy()
         self.assertEqual(result.returncode, 1)
         self.assertIn('rollback', result.stderr)
+        self.assertIn('tracebacks=1', result.stdout)
+
+    def test_library_only_traceback_is_a_warning(self):
+        venv_frame = f"{self.app}/venv/lib/python3.11/site-packages/httpx/_client.py"
+        self.journal.write_text(
+            self.app_traceback(venv_frame)
+            + "2026-10-09 18:52:00,000 [ERROR] telegram.ext.Updater: "
+              "Error while getting Updates: httpx.ReadError\n")
+        result = self.deploy()
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn('tracebacks=0 errors=0 token_urls=0', result.stdout)
+        self.assertIn('library_tracebacks=1 library_errors=1', result.stdout)
+        self.assertIn('warning', result.stderr)
+
+    def test_app_logger_error_fails(self):
+        self.journal.write_text(
+            "2026-10-09 18:52:00,000 [ERROR] poller: Failed to record grid state: x\n")
+        result = self.deploy()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('errors=1', result.stdout)
+
+    def test_token_url_fails(self):
+        self.journal.write_text(
+            "2026-10-09 18:52:00,000 [INFO] httpx: POST https://api.telegram.org/bot123:abc/x\n")
+        result = self.deploy()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('token_urls=1', result.stdout)
 
     def test_inactive_unit_fails_with_rollback_hint(self):
         self.env['FAKE_STATE'] = 'failed'
