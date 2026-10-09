@@ -129,6 +129,9 @@ sudo systemctl enable --now luxpower-bot-public luxpower-bot-private
 | `STALE_DATA_SECONDS` | 180 | RPi data older than this → state "unknown" (🟡) |
 | `UNKNOWN_ALERT_AFTER` | 300 | Seconds of "unknown" before the owner is alerted |
 | `RETENTION_DAYS` | 90 | Days of `inverter_status` samples to keep |
+| `NTFY_URL` | `https://ntfy.sh` | ntfy server for owner alerts outside Telegram |
+| `NTFY_TOPIC` | — | Secret ntfy topic (empty = ntfy disabled); test with `/ntfytest` in the private bot |
+| `NTFY_TOKEN` | — | Optional ntfy access token (sent as `Authorization: Bearer`) |
 
 ### Grid state history (`grid_intervals`)
 

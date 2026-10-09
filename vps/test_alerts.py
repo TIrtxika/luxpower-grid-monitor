@@ -133,5 +133,66 @@ class RunAsyncTest(unittest.TestCase):
         self.assertIn("http client closed", logs.output[0])
 
 
+class FakeChannel:
+    def __init__(self, fail=False):
+        self.notices = []
+        self.fail = fail
+
+    def send(self, notice):
+        if self.fail:
+            raise RuntimeError("ntfy down")
+        self.notices.append(notice)
+        return True
+
+
+class OwnerChannelsTest(unittest.TestCase):
+    def grid(self, change, channel, subscribers=()):
+        db = MagicMock()
+        db.get_active_subscribers.return_value = list(subscribers)
+        public = bot()
+        am = AlertManager(public, owner_channels=[channel])
+        with patch.object(alerts, 'get_db', return_value=db), \
+             patch.object(alerts.config, 'OWNER_CHAT_ID', 42), \
+             patch.object(alerts.config, 'PUBLIC_CHANNEL_ID', ''):
+            asyncio.run(am.send_grid_alert(change, STATUS))
+        return public
+
+    def unknown(self, *args):
+        channel = FakeChannel()
+        with patch.object(alerts.config, 'OWNER_CHAT_ID', 42):
+            asyncio.run(AlertManager(bot(), bot(), owner_channels=[channel])
+                        ._send_unknown_alert(*args))
+        return channel.notices[0]
+
+    def test_grid_off_is_high_priority(self):
+        channel = FakeChannel()
+        self.grid(GridChange('off', 0, None, False), channel)
+        n = channel.notices[0]
+        self.assertEqual((n.title, n.priority, n.tags),
+                         ("Світла немає", 4, ('red_circle',)))
+
+    def test_grid_on_has_duration(self):
+        channel = FakeChannel()
+        self.grid(GridChange('on', 0, 3900, False), channel)
+        n = channel.notices[0]
+        self.assertEqual((n.title, n.priority, n.tags),
+                         ("Світло є", 3, ('green_circle',)))
+        self.assertIn("1 год 5 хв", n.message)
+
+    def test_unknown_states(self):
+        active = self.unknown(True, 'stale_data', 300)
+        self.assertEqual((active.priority, active.tags), (3, ('yellow_circle',)))
+        self.assertIn("дані застарілі", active.message)
+        restored = self.unknown(False, None, 600)
+        self.assertEqual((restored.priority, restored.tags), (2, ('white_check_mark',)))
+        downtime = self.unknown(False, 'monitor_downtime', 7200)
+        self.assertEqual((downtime.priority, downtime.tags), (3, ('warning',)))
+
+    def test_channel_failure_does_not_stop_telegram(self):
+        public = self.grid(GridChange('off', 0, None, False), FakeChannel(fail=True),
+                           subscribers=[1, 2])
+        self.assertEqual(public.send_message.await_count, 2)
+
+
 if __name__ == '__main__':
     unittest.main()

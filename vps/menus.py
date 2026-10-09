@@ -20,6 +20,7 @@ PRIVATE_COMMANDS = [
     BotCommand("chart", "Графіки"),
     BotCommand("stats", "Статистика відключень"),
     BotCommand("subscribers", "Кількість підписників"),
+    BotCommand("ntfytest", "Тест сповіщення ntfy"),
     BotCommand("help", "Допомога"),
 ]
 

@@ -6,7 +6,7 @@ Sends notifications to subscribers and owner
 import logging
 import asyncio
 from datetime import datetime
-from typing import Optional, Dict
+from typing import Optional, Dict, Sequence
 from zoneinfo import ZoneInfo
 
 # Kyiv timezone (EET/EEST, follows DST)
@@ -22,6 +22,7 @@ from telegram.error import Forbidden, TelegramError
 
 import config
 from database import get_db
+from notifiers import Notice, PRIORITY_DEFAULT, PRIORITY_HIGH, PRIORITY_LOW
 from grid_state import (
     GridChange, ON,
     REASON_RPI_UNREACHABLE, REASON_DONGLE_OFFLINE, REASON_STALE_DATA,
@@ -66,14 +67,25 @@ def format_seconds(seconds: int) -> str:
 class AlertManager:
     """Manages alerts and notifications"""
 
-    def __init__(self, public_bot: Bot, private_bot: Bot = None):
+    def __init__(self, public_bot: Bot, private_bot: Bot = None,
+                 owner_channels: Sequence = ()):
         self.public_bot = public_bot
         self.private_bot = private_bot
+        # Extra owner channels outside Telegram (objects with send(Notice))
+        self.owner_channels = list(owner_channels)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop):
         """Set event loop for async operations"""
         self._loop = loop
+
+    async def _notify_owner_channels(self, notice: Notice):
+        """Send to ntfy & co. in a thread; failures never affect Telegram"""
+        for channel in self.owner_channels:
+            try:
+                await asyncio.to_thread(channel.send, notice)
+            except Exception as e:
+                logger.error(f"Owner channel failed: {type(e).__name__}")
 
     def _format_grid_message(self, grid_on: bool, status: Dict,
                              duration: int = None,
@@ -218,6 +230,14 @@ class AlertManager:
                 self._format_private_status(status)
             )
 
+        # Owner channels outside Telegram: same text, plain title
+        body = message.split("\n", 1)[1].strip() if "\n" in message else message
+        if grid_on:
+            notice = Notice("Світло є", body, PRIORITY_DEFAULT, ('green_circle',))
+        else:
+            notice = Notice("Світла немає", body, PRIORITY_HIGH, ('red_circle',))
+        await self._notify_owner_channels(notice)
+
     def on_grid_change(self, change: GridChange, status: Optional[Dict]):
         """Poller callback: grid ON <-> OFF"""
         self._run_async(self.send_grid_alert(change, status))
@@ -229,27 +249,29 @@ class AlertManager:
 
     async def _send_unknown_alert(self, active: bool, reason: Optional[str],
                                   seconds: int):
-        """Unknown-state alerts go to the owner only"""
-        if not config.OWNER_CHAT_ID:
-            return
-        bot = self.private_bot or self.public_bot
+        """Unknown-state alerts go to the owner only (Telegram + channels)"""
         now = kyiv_now().strftime('%H:%M:%S %d.%m.%Y')
         duration = format_seconds(seconds)
 
         if active:
             reason_text = UNKNOWN_REASONS_UA.get(reason, reason or "невідомо")
-            msg = (f"\U0001f7e1 Немає даних про мережу\n"
-                   f"Причина: {reason_text}\n"
-                   f"Вже {duration}\n\n{now}")
+            emoji, title = "\U0001f7e1", "Немає даних про мережу"
+            body = f"Причина: {reason_text}\nВже {duration}\n\n{now}"
+            priority, tags = PRIORITY_DEFAULT, ('yellow_circle',)
         elif reason == REASON_MONITOR_DOWNTIME:
-            msg = (f"⚠️ Моніторинг не працював {duration}\n"
-                   f"Стан мережі за цей час невідомий\n\n{now}")
+            emoji, title = "⚠️", f"Моніторинг не працював {duration}"
+            body = f"Стан мережі за цей час невідомий\n\n{now}"
+            priority, tags = PRIORITY_DEFAULT, ('warning',)
         else:
-            msg = (f"✅ Дані знову надходять\n"
-                   f"Не було даних: {duration}\n\n{now}")
+            emoji, title = "✅", "Дані знову надходять"
+            body = f"Не було даних: {duration}\n\n{now}"
+            priority, tags = PRIORITY_LOW, ('white_check_mark',)
 
-        await self._send_message_async(bot, config.OWNER_CHAT_ID, msg)
-
+        if config.OWNER_CHAT_ID:
+            bot = self.private_bot or self.public_bot
+            await self._send_message_async(bot, config.OWNER_CHAT_ID,
+                                           f"{emoji} {title}\n{body}")
+        await self._notify_owner_channels(Notice(title, body, priority, tags))
     async def send_status_to_owner(self, status: Dict):
         """Send status to owner (private bot)"""
         if not self.private_bot or not config.OWNER_CHAT_ID:
