@@ -8,6 +8,7 @@ import logging
 import sys
 import asyncio
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import requests
@@ -390,6 +391,20 @@ async def cmd_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # =============================================================================
 
+async def _init_owner_bot(owner_bot: Bot) -> Optional[Bot]:
+    """Initialize the private bot used for owner alerts, None if it fails.
+
+    Only the exception type is logged: InvalidToken's message contains the token.
+    """
+    try:
+        await owner_bot.initialize()
+        return owner_bot
+    except Exception as e:
+        logger.error(f"Private bot unavailable for owner alerts: "
+                     f"{type(e).__name__}")
+        return None
+
+
 def run_public_bot():
     """Run public bot only"""
     logger.info("Starting public bot...")
@@ -401,30 +416,28 @@ def run_public_bot():
 
     async def on_start(application: Application):
         """Wire alerts and start polling once the bot loop is running"""
-        owner_bot = private_bot
-        try:
-            await private_bot.initialize()
-        except Exception as e:
-            logger.error(f"Private bot unavailable for owner alerts: {e}")
-            owner_bot = None
-
-        alert_manager = AlertManager(application.bot, owner_bot)
+        alert_manager = AlertManager(application.bot,
+                                     await _init_owner_bot(private_bot))
         alert_manager.set_event_loop(asyncio.get_running_loop())
         poller.add_state_callback(alert_manager.on_grid_change)
         poller.add_unknown_callback(alert_manager.on_unknown_change)
         poller.start()
 
     async def on_stop(application: Application):
+        """Stop polling while the bot's HTTP client is still open"""
         poller.stop()
+
+    async def on_shutdown(application: Application):
         try:
             await private_bot.shutdown()
         except Exception as e:
-            logger.warning(f"Private bot shutdown: {e}")
+            logger.warning(f"Private bot shutdown: {type(e).__name__}")
 
     app = (Application.builder()
            .token(config.PUBLIC_BOT_TOKEN)
            .post_init(on_start)
-           .post_shutdown(on_stop)
+           .post_stop(on_stop)
+           .post_shutdown(on_shutdown)
            .build())
 
     # Add handlers

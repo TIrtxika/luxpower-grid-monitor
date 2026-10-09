@@ -67,8 +67,9 @@ class MainTest(unittest.TestCase):
         db.get_state_samples.return_value = [s(0), s(5)]
         with redirect_stdout(io.StringIO()):
             self.assertEqual(main(['--force'], db=db), 0)
-        db.truncate_intervals.assert_called_once()
-        db.insert_intervals.assert_called_once()
+        # wipe + insert in one transaction, so a failed insert keeps old rows
+        db.replace_intervals.assert_called_once()
+        db.insert_intervals.assert_not_called()
 
 
 if __name__ == '__main__':

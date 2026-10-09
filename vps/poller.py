@@ -51,7 +51,8 @@ class RpiPoller:
         self.tracker = self._new_tracker()
         self._unsaved: List[Transition] = []
         self._unknown_alerted = False
-        self._unknown_since: float = 0
+        self._unknown_since: float = 0       # start of the unknown period
+        self._unknown_alert_from: float = 0  # 🟡 alert threshold counts from here
 
         # Callbacks
         self._state_callbacks: List[Callable] = []
@@ -150,6 +151,20 @@ class RpiPoller:
         else:
             self.tracker = self._new_tracker(last_known=last_known)
 
+        if open_iv and open_iv['state'] == UNKNOWN:
+            started = open_iv['started_at'].timestamp()
+            self._unknown_since = started
+            if gap:
+                # The downtime message goes out below; give the 🟡 alert
+                # a fresh threshold from now
+                self._unknown_alert_from = now
+                self._unknown_alerted = False
+            else:
+                # Quick restart: the owner was already alerted if it is old
+                self._unknown_alert_from = started
+                self._unknown_alerted = (now - started
+                                         >= config.UNKNOWN_ALERT_AFTER)
+
         if gap:
             gap_start, gap_end = gap
             seconds = int((gap_end - gap_start).total_seconds())
@@ -178,7 +193,11 @@ class RpiPoller:
             self._unsaved.pop(0)
 
         if transition is None and self.tracker.state is not None:
-            db.heartbeat(_dt(now))
+            if db.heartbeat(_dt(now)) == 0:
+                # Open interval vanished (e.g. table rewritten): reopen it
+                logger.warning("No open grid interval, reopening current state")
+                db.switch_state(self.tracker.state, _dt(self.tracker.since),
+                                _dt(now))
         return closed
 
     def _on_transition(self, t: Transition, closed: Optional[Dict]):
@@ -187,6 +206,7 @@ class RpiPoller:
 
         if t.state == UNKNOWN:
             self._unknown_since = t.at
+            self._unknown_alert_from = t.at
         elif t.previous == UNKNOWN and self._unknown_alerted:
             self._unknown_alerted = False
             self._fire_unknown(False, None, int(t.at - self._unknown_since))
@@ -208,9 +228,8 @@ class RpiPoller:
 
     def _check_unknown_alert(self, now: float):
         if (self.tracker.state == UNKNOWN and not self._unknown_alerted
-                and now - self.tracker.since >= config.UNKNOWN_ALERT_AFTER):
+                and now - self._unknown_alert_from >= config.UNKNOWN_ALERT_AFTER):
             self._unknown_alerted = True
-            self._unknown_since = self.tracker.since
             self._fire_unknown(True, self.tracker.reason,
                                int(now - self.tracker.since))
 

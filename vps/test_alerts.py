@@ -105,6 +105,33 @@ class RunAsyncTest(unittest.TestCase):
         m.assert_called_once_with(coro, loop)
         coro.close()
 
+    def test_uses_threadsafe_dispatch_between_loop_runs(self):
+        # run_polling drives the loop with separate run_until_complete calls;
+        # between them is_running() is False but the loop is still the bot's
+        loop = MagicMock()
+        loop.is_running.return_value = False
+        am = AlertManager(bot())
+        am.set_event_loop(loop)
+
+        async def noop():
+            pass
+
+        coro = noop()
+        with patch.object(alerts.asyncio, 'run_coroutine_threadsafe') as m, \
+             patch.object(alerts.asyncio, 'run') as run:
+            am._run_async(coro)
+        m.assert_called_once_with(coro, loop)
+        run.assert_not_called()
+        coro.close()
+
+    def test_failed_background_send_is_logged(self):
+        future = MagicMock()
+        future.cancelled.return_value = False
+        future.exception.return_value = RuntimeError("http client closed")
+        with self.assertLogs('alerts', level='ERROR') as logs:
+            alerts._log_future_error(future)
+        self.assertIn("http client closed", logs.output[0])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -66,5 +66,46 @@ class BotHandlersTest(unittest.TestCase):
         self.assertIn("Доступність", text)
 
 
+class OwnerBotInitTest(unittest.TestCase):
+    def test_init_failure_does_not_log_token(self):
+        from telegram.error import InvalidToken
+        owner = MagicMock()
+        owner.initialize = AsyncMock(
+            side_effect=InvalidToken("The token `123:SECRET` was rejected"))
+        with self.assertLogs('bot', level='ERROR') as logs:
+            result = asyncio.run(bot._init_owner_bot(owner))
+        self.assertIsNone(result)
+        self.assertNotIn("SECRET", "\n".join(logs.output))
+
+    def test_init_success_returns_bot(self):
+        owner = MagicMock()
+        owner.initialize = AsyncMock()
+        self.assertIs(asyncio.run(bot._init_owner_bot(owner)), owner)
+
+
+class PublicBotWiringTest(unittest.TestCase):
+    def test_poller_stops_in_post_stop_before_http_shutdown(self):
+        builder = MagicMock()
+        for name in ('token', 'post_init', 'post_stop', 'post_shutdown'):
+            getattr(builder, name).return_value = builder
+        app = MagicMock()
+        builder.build.return_value = app
+        poller = MagicMock()
+
+        with patch.object(bot.Application, 'builder', return_value=builder), \
+             patch.object(bot, 'get_db'), patch.object(bot, 'close_db'), \
+             patch.object(bot, 'get_poller', return_value=poller), \
+             patch.object(bot, 'Bot'):
+            bot.run_public_bot()
+
+        post_stop = builder.post_stop.call_args.args[0]
+        asyncio.run(post_stop(app))
+        poller.stop.assert_called_once()
+
+        post_shutdown = builder.post_shutdown.call_args.args[0]
+        asyncio.run(post_shutdown(app))
+        poller.stop.assert_called_once()
+
+
 if __name__ == '__main__':
     unittest.main()

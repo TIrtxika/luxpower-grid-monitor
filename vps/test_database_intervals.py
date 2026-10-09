@@ -112,8 +112,25 @@ class GridIntervalsDbTest(unittest.TestCase):
         ])
         self.assertEqual(self.db.count_intervals(), 2)
         self.assertIsNone(self.db.get_open_interval())
-        self.db.truncate_intervals()
-        self.assertEqual(self.db.count_intervals(), 0)
+        self.db.replace_intervals([
+            {'state': 'unknown', 'started_at': T(0), 'ended_at': T(9)},
+        ])
+        self.assertEqual(self.db.count_intervals(), 1)
+
+    def test_failed_replace_keeps_old_rows(self):
+        self.db.insert_intervals([
+            {'state': 'on', 'started_at': T(0), 'ended_at': T(5)},
+        ])
+        with self.assertRaises(Exception):
+            self.db.replace_intervals([
+                {'state': 'bogus', 'started_at': T(0), 'ended_at': T(5)},
+            ])
+        self.assertEqual(self.db.count_intervals(), 1)
+
+    def test_heartbeat_reports_missing_open_interval(self):
+        self.assertEqual(self.db.heartbeat(T(0)), 0)
+        self.db.switch_state('on', T(0), T(0))
+        self.assertEqual(self.db.heartbeat(T(1)), 1)
 
     def test_state_samples(self):
         with self.db.get_connection() as conn:

@@ -43,6 +43,15 @@ UNKNOWN_REASONS_UA = {
 }
 
 
+def _log_future_error(future):
+    """Done-callback for alerts sent from the poller thread"""
+    if future.cancelled():
+        return
+    exc = future.exception()
+    if exc is not None:
+        logger.error(f"Background alert failed: {type(exc).__name__}: {exc}")
+
+
 def format_seconds(seconds: int) -> str:
     """'2 год 5 хв' / '5 хв 3 сек' / '40 сек'"""
     hours, rest = divmod(int(seconds), 3600)
@@ -142,12 +151,18 @@ class AlertManager:
             return SEND_ERROR
 
     def _run_async(self, coro):
-        """Run coroutine on the bot's event loop (called from poller thread)"""
-        if self._loop is not None and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(coro, self._loop)
-        else:
-            logger.warning("Bot event loop not running, sending synchronously")
+        """Run coroutine on the bot's event loop (called from poller thread).
+
+        run_polling drives the loop with separate run_until_complete calls,
+        so is_running() can be False in between: queue the coroutine anyway,
+        it runs on the next turn. Never run the bot's client on another loop.
+        """
+        if self._loop is None:
+            logger.warning("Bot event loop not set, sending synchronously")
             asyncio.run(coro)
+            return
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        future.add_done_callback(_log_future_error)
 
     async def send_grid_alert(self, change: GridChange, status: Optional[Dict]):
         """Save the event, then notify subscribers, channel and owner"""

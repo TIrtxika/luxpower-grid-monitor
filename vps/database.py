@@ -242,14 +242,15 @@ class Database:
                 row = cur.fetchone()
                 return row[0] if row else None
 
-    def heartbeat(self, now: datetime):
-        """Mark the open interval as still observed"""
+    def heartbeat(self, now: datetime) -> int:
+        """Mark the open interval as still observed; 0 = no open interval"""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     UPDATE grid_intervals SET last_seen_at = %s
                     WHERE ended_at IS NULL
                 """, (now,))
+                return cur.rowcount
 
     def switch_state(self, state: str, at: datetime,
                      now: datetime) -> Optional[Dict]:
@@ -362,21 +363,27 @@ class Database:
                 """)
                 return [dict(row) for row in cur.fetchall()]
 
+    @staticmethod
+    def _insert_closed(cur, rows: List[Dict]):
+        cur.executemany("""
+            INSERT INTO grid_intervals
+                (state, started_at, ended_at, last_seen_at)
+            VALUES (%s, %s, %s, %s)
+        """, [(r['state'], r['started_at'], r['ended_at'], r['ended_at'])
+              for r in rows])
+
     def insert_intervals(self, rows: List[Dict]):
         """Insert closed intervals (migration)"""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
-                cur.executemany("""
-                    INSERT INTO grid_intervals
-                        (state, started_at, ended_at, last_seen_at)
-                    VALUES (%s, %s, %s, %s)
-                """, [(r['state'], r['started_at'], r['ended_at'], r['ended_at'])
-                      for r in rows])
+                self._insert_closed(cur, rows)
 
-    def truncate_intervals(self):
+    def replace_intervals(self, rows: List[Dict]):
+        """Wipe grid_intervals and insert `rows` in one transaction"""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("TRUNCATE grid_intervals RESTART IDENTITY")
+                self._insert_closed(cur, rows)
 
     # =========================================================================
     # EVENTS METHODS

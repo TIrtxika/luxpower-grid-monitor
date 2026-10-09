@@ -97,8 +97,9 @@ def main(argv=None, db=None) -> int:
         return 0
 
     if args.force:
-        db.truncate_intervals()
-    db.insert_intervals(intervals)
+        db.replace_intervals(intervals)
+    else:
+        db.insert_intervals(intervals)
     print(f"written: {len(intervals)}")
     return 0
 

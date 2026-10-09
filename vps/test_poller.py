@@ -29,6 +29,7 @@ class FakeDb:
         self.saved = []
         self.cleanups = []
         self.fail_switch = 0
+        self.heartbeat_rows = 1
 
     def recover_gap(self, now, max_gap):
         return self.gap
@@ -41,6 +42,7 @@ class FakeDb:
 
     def heartbeat(self, now):
         self.heartbeats.append(now)
+        return self.heartbeat_rows
 
     def switch_state(self, state, at, now):
         if self.fail_switch:
@@ -153,6 +155,30 @@ class PollerTest(unittest.TestCase):
         self.assertEqual(h.db.cleanups, [90])
         h.poll(86400, st(True))
         self.assertEqual(h.db.cleanups, [90, 90])
+
+    def test_quick_restart_during_unknown_does_not_realert(self):
+        h = Harness(seeded('unknown', started=-3600))
+        for t in (0, 60, 120, 180):
+            h.poll(t, None)
+        self.assertEqual(h.unknown, [])
+
+    def test_restart_after_gap_waits_full_threshold_before_unknown_alert(self):
+        db = FakeDb(open_iv={'state': 'unknown', 'started_at': dt(-7200),
+                             'last_seen_at': dt(-3600)},
+                    last_known='on', gap=(dt(-3600), dt(0)))
+        h = Harness(db)
+        for t in (0, 60, 120, 180, 240):
+            h.poll(t, None)
+        self.assertEqual(h.unknown, [(False, 'monitor_downtime', 3600)])
+        h.poll(300, None)
+        self.assertEqual(h.unknown[-1], (True, 'rpi_unreachable', 7500))
+
+    def test_vanished_open_interval_is_reopened(self):
+        db = seeded('on')
+        db.heartbeat_rows = 0  # e.g. migration --force wiped the table
+        h = Harness(db)
+        h.poll(0, st(True))
+        self.assertEqual(db.switches, [('on', dt(-1000))])
 
     def test_empty_db_first_poll_opens_interval_without_alert(self):
         h = Harness(FakeDb())
