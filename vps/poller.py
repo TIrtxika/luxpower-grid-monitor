@@ -4,6 +4,7 @@ Fetches data from RPi, tracks the effective grid state (on/off/unknown)
 and records it as intervals in the database
 """
 
+import functools
 import time
 import logging
 import threading
@@ -15,6 +16,8 @@ import requests
 import config
 from battery import LowBatteryWatch, forecast as battery_forecast
 from database import get_db
+from schedule import fetch_group, fetch_schedule
+from schedule_watch import ScheduleWatch
 from grid_state import (
     StateTracker, Transition, GridChange, ON, OFF, UNKNOWN,
     REASON_MONITOR_DOWNTIME,
@@ -59,6 +62,9 @@ class RpiPoller:
         # SOC of the current outage, low-battery thresholds
         self.battery_watch = LowBatteryWatch(config.BATTERY_ALERT_LEVELS)
 
+        # Planned outage schedule (None when DTEK_GROUP is not set)
+        self.schedule: Optional[ScheduleWatch] = self._new_schedule_watch()
+
         # Callbacks
         self._state_callbacks: List[Callable] = []
         self._unknown_callbacks: List[Callable] = []
@@ -70,6 +76,24 @@ class RpiPoller:
             unreachable_threshold=config.RPI_UNREACHABLE_THRESHOLD,
             stale_after_s=config.STALE_DATA_SECONDS,
             **seed,
+        )
+
+    def _new_schedule_watch(self) -> Optional[ScheduleWatch]:
+        group = config.DTEK_GROUP
+        if not group:
+            return None
+        group_check = None
+        if config.YASNO_STREET_ID and config.YASNO_HOUSE_ID:
+            group_check = functools.partial(
+                fetch_group, config.YASNO_ADDRESSES_URL,
+                config.YASNO_STREET_ID, config.YASNO_HOUSE_ID)
+        return ScheduleWatch(
+            group,
+            lambda: fetch_schedule(config.YASNO_SCHEDULE_URL, group),
+            self._db_factory,
+            refresh_s=config.SCHEDULE_REFRESH,
+            lead=timedelta(minutes=config.SCHEDULE_REMIND_MINUTES),
+            group_check=group_check,
         )
 
     def add_state_callback(self, callback: Callable):
@@ -293,6 +317,7 @@ class RpiPoller:
         if status is not None:
             self._maybe_store(status, now)
         self._maybe_cleanup(now)
+        self._check_schedule(now)
         self._ping_watchdog()
 
     def _check_battery(self, status: Optional[Dict], now: float):
@@ -316,6 +341,14 @@ class RpiPoller:
                 callback(level, soc, fc)
             except Exception as e:
                 logger.error(f"Battery callback error: {e}")
+
+    def _check_schedule(self, now: float):
+        if self.schedule is None:
+            return
+        try:
+            self.schedule.tick(now)
+        except Exception as e:
+            logger.error(f"Schedule check failed: {type(e).__name__}")
 
     def _ping_watchdog(self):
         """Tell the external watchdog (healthchecks.io) the monitor is alive"""

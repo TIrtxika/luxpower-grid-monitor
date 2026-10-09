@@ -96,6 +96,12 @@ def settings_keyboard(s: Settings) -> InlineKeyboardMarkup:
              for mode, label in MODE_LABELS.items()]
     rows.append(modes[:2])
     rows.append(modes[2:])
+    if s.remind_enabled:
+        rows.append([InlineKeyboardButton("⏰ Нагадування за графіком: увімк",
+                                          callback_data="set:remind:off")])
+    else:
+        rows.append([InlineKeyboardButton("⏰ Нагадування за графіком: вимк",
+                                          callback_data="set:remind:on")])
     return InlineKeyboardMarkup(rows)
 
 

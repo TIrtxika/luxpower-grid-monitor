@@ -22,7 +22,8 @@ from telegram.error import Forbidden, TelegramError
 
 import config
 from database import get_db
-from subscriptions import in_quiet_hours, wants
+from schedule import PlannedOutage
+from subscriptions import Settings, in_quiet_hours, wants
 from notifiers import (
     Notice, PRIORITY_DEFAULT, PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_URGENT,
 )
@@ -180,6 +181,21 @@ class AlertManager:
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         future.add_done_callback(_log_future_error)
 
+    async def _deliver(self, db, subscribers: Sequence[Settings], message: str):
+        """Public bot fan-out; drops subscribers who blocked the bot"""
+        now = kyiv_now()
+        for settings in subscribers:
+            # Quiet hours: deliver without sound, never drop the message
+            result = await self._send_message_async(
+                self.public_bot, settings.chat_id, message,
+                silent=in_quiet_hours(settings, now))
+            if result == SEND_BLOCKED:
+                try:
+                    db.remove_subscriber(settings.chat_id)
+                    logger.info(f"Deactivated subscriber {settings.chat_id}")
+                except Exception as e:
+                    logger.error(f"Failed to deactivate {settings.chat_id}: {e}")
+
     async def send_grid_alert(self, change: GridChange, status: Optional[Dict]):
         """Save the event, then notify subscribers, channel and owner"""
         status = status or {}
@@ -209,20 +225,8 @@ class AlertManager:
 
         logger.info(f"Sending grid alert to {len(subscribers)} subscribers")
 
-        now = kyiv_now()
-        for settings in subscribers:
-            if not wants(settings, grid_on):
-                continue
-            # Quiet hours: deliver without sound, never drop the message
-            result = await self._send_message_async(
-                self.public_bot, settings.chat_id, message,
-                silent=in_quiet_hours(settings, now))
-            if result == SEND_BLOCKED:
-                try:
-                    db.remove_subscriber(settings.chat_id)
-                    logger.info(f"Deactivated subscriber {settings.chat_id}")
-                except Exception as e:
-                    logger.error(f"Failed to deactivate {settings.chat_id}: {e}")
+        await self._deliver(db, [s for s in subscribers if wants(s, grid_on)],
+                            message)
 
         # Send to public channel if configured
         if config.PUBLIC_CHANNEL_ID:
@@ -306,6 +310,52 @@ class AlertManager:
             await self._send_message_async(bot, config.OWNER_CHAT_ID,
                                            f"{emoji} {title}\n{body}")
         await self._notify_owner_channels(Notice(title, body, priority, tags))
+
+    def on_planned_outage(self, outage: PlannedOutage):
+        """Schedule callback: a planned outage starts soon"""
+        self._run_async(self._send_reminder(outage))
+
+    def on_group_change(self, configured: str, actual: str):
+        """Schedule callback: the address moved to another group"""
+        self._run_async(self._send_group_change(configured, actual))
+
+    async def _send_reminder(self, outage: PlannedOutage):
+        """Reminder to subscribers who want it, and to the owner"""
+        start = outage.start.astimezone(KYIV_TZ).strftime('%H:%M')
+        end = outage.end.astimezone(KYIV_TZ).strftime('%H:%M')
+        title = f"Відключення за графіком о {start}"
+        body = f"За графіком ДТЕК світла не буде {start}–{end}"
+        message = f"\u23f0 {title}\n{body}"
+
+        db = get_db()
+        try:
+            subscribers = db.get_subscriber_settings()
+        except Exception as e:
+            logger.error(f"Failed to load subscribers: {e}")
+            subscribers = []
+        owner = config.OWNER_CHAT_ID
+        # The owner gets it once, from the private bot when there is one
+        skip_owner = bool(owner and self.private_bot)
+        await self._deliver(db, [s for s in subscribers if s.remind_enabled
+                                 and not (skip_owner and s.chat_id == owner)],
+                            message)
+
+        if skip_owner:
+            await self._send_message_async(self.private_bot, owner, message)
+        await self._notify_owner_channels(
+            Notice(title, body, PRIORITY_DEFAULT, ('calendar',)))
+
+    async def _send_group_change(self, configured: str, actual: str):
+        """The address now belongs to another schedule group: owner only"""
+        title = f"Змінилась група графіка: {configured} → {actual}"
+        body = (f"YASNO повертає для вашої адреси групу {actual}. "
+                f"Онови DTEK_GROUP={actual} у .env і перезапусти ботів.")
+        if config.OWNER_CHAT_ID:
+            bot = self.private_bot or self.public_bot
+            await self._send_message_async(bot, config.OWNER_CHAT_ID,
+                                           f"\u26a0\ufe0f {title}\n{body}")
+        await self._notify_owner_channels(
+            Notice(title, body, PRIORITY_HIGH, ('warning',)))
 
     async def send_status_to_owner(self, status: Dict):
         """Send status to owner (private bot)"""

@@ -210,10 +210,54 @@ class SubscriberSettingsDbTest(unittest.TestCase):
     def test_unknown_chat_has_no_settings(self):
         self.assertIsNone(self.db.get_settings(999))
 
+    def test_reminders_on_by_default_and_toggle(self):
+        self.db.add_subscriber(1, 'a')
+        self.assertTrue(self.db.get_settings(1).remind_enabled)
+        self.db.update_settings(1, remind_enabled=False)
+        self.assertFalse(self.db.get_settings(1).remind_enabled)
+
     def test_migration_is_idempotent_for_existing_rows(self):
         self.db.add_subscriber(1, 'a')
         self.db._create_tables()
         self.assertEqual(self.db.get_settings(1).quiet_from, time(23))
+
+
+@unittest.skipUnless(TEST_URL, "TEST_DATABASE_URL not set")
+class PlannedOutagesDbTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.db = Database(TEST_URL)
+        cls.db.connect()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.db.close()
+
+    def setUp(self):
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE planned_outages")
+
+    def day(self, d, status='ScheduleApplies', spans=()):
+        from schedule import DaySchedule, PlannedOutage
+        return DaySchedule(d, status, tuple(PlannedOutage(a, b) for a, b in spans))
+
+    def test_save_and_load_replaces_same_day(self):
+        from datetime import date
+        d9 = date(2026, 10, 9)
+        first = self.day(d9, spans=[(T(0), T(60))])
+        second = self.day(d9, spans=[(T(120), T(180))])
+        self.db.save_schedule('16.1', [first], T(0))
+        self.db.save_schedule('16.1', [second, self.day(date(2026, 10, 10), 'WaitingForSchedule')],
+                              T(5))
+        loaded = self.db.get_schedule('16.1', d9, date(2026, 10, 10))
+        self.assertEqual(loaded, [second, self.day(date(2026, 10, 10), 'WaitingForSchedule')])
+
+    def test_other_group_and_range(self):
+        from datetime import date
+        self.db.save_schedule('16.1', [self.day(date(2026, 10, 1))], T(0))
+        self.db.save_schedule('17.1', [self.day(date(2026, 10, 9))], T(0))
+        self.assertEqual(self.db.get_schedule('16.1', date(2026, 10, 5), date(2026, 10, 9)), [])
 
 
 if __name__ == '__main__':

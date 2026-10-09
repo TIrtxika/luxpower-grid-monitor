@@ -36,6 +36,11 @@ class SettingsTextTest(unittest.TestCase):
         self.assertIn("вимкнено", text)
         self.assertIn("лише відключення", text)
 
+    def test_reminder_line(self):
+        self.assertIn("Нагадування за графіком: увімк", format_settings(Settings(CHAT)))
+        self.assertIn("Нагадування за графіком: вимк",
+                      format_settings(Settings(CHAT, remind_enabled=False)))
+
 
 class SettingsKeyboardTest(unittest.TestCase):
     def test_marks_current_choices(self):
@@ -49,6 +54,11 @@ class SettingsKeyboardTest(unittest.TestCase):
         kb = menus.settings_keyboard(Settings(CHAT, quiet_enabled=False))
         self.assertIn('set:quiet:on', callbacks(kb))
         self.assertNotIn('set:window:22-07', callbacks(kb))
+
+    def test_reminder_toggle(self):
+        self.assertIn('set:remind:off', callbacks(menus.settings_keyboard(Settings(CHAT))))
+        self.assertIn('set:remind:on', callbacks(menus.settings_keyboard(
+            Settings(CHAT, remind_enabled=False))))
 
 
 class SettingsCommandTest(unittest.TestCase):
@@ -97,6 +107,10 @@ class SettingsCallbackTest(unittest.TestCase):
     def test_quiet_off(self):
         db, _ = self.press('set:quiet:off')
         db.update_settings.assert_called_once_with(CHAT, quiet_enabled=False)
+
+    def test_remind_off(self):
+        db, _ = self.press('set:remind:off')
+        db.update_settings.assert_called_once_with(CHAT, remind_enabled=False)
 
     def test_invalid_value_is_ignored(self):
         db, query = self.press('set:mode:sometimes')

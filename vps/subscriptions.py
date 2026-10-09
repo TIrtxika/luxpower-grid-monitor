@@ -26,6 +26,7 @@ class Settings:
     quiet_from: time = time(23)
     quiet_to: time = time(7)
     notify_mode: str = 'all'
+    remind_enabled: bool = True  # reminders before planned outages
 
 
 def in_quiet_hours(s: Settings, now: datetime) -> bool:

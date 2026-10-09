@@ -46,6 +46,14 @@ def format_duration(seconds: float) -> str:
     return f"{total_minutes} хв"
 
 
+def format_plan_fact(label: str, planned_s: float, fact_s: float) -> str:
+    """'📅 План / факт за 7 днів: за графіком 3 год, фактично 2 год 10 хв'"""
+    def hours(s):
+        return format_duration(s) if s >= 60 else "0 год"
+    return (f"\U0001f4c5 План / факт {label}: за графіком {hours(planned_s)}, "
+            f"фактично {hours(fact_s)} без світла")
+
+
 def make_bar(on: float, off: float, unknown: float, width: int = 16) -> str:
     """Visual bar: on=█, off=░, unknown=▒ proportional to time"""
     total = on + off + unknown
@@ -220,7 +228,9 @@ def format_settings(s) -> str:
         quiet = "\U0001f514 Тихі години вимкнено"
     return ("⚙️ Налаштування сповіщень\n\n"
             f"{quiet}\n"
-            f"\U0001f4e3 Надсилати: {MODE_TEXT.get(s.notify_mode, s.notify_mode)}")
+            f"\U0001f4e3 Надсилати: {MODE_TEXT.get(s.notify_mode, s.notify_mode)}\n"
+            f"⏰ Нагадування за графіком: "
+            f"{'увімк — за 30 хв до відключення' if s.remind_enabled else 'вимк'}")
 
 
 def format_battery_line(fc) -> str:
