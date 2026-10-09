@@ -5,7 +5,7 @@ Run: TEST_DATABASE_URL=postgresql://... python -m unittest test_database_interva
 
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 
 from database import Database
 
@@ -143,6 +143,58 @@ class GridIntervalsDbTest(unittest.TestCase):
         self.assertEqual([(s['timestamp'], s['connected'], s['grid_available'])
                           for s in samples],
                          [(T(0), False, None), (T(5), True, True)])
+
+
+@unittest.skipUnless(TEST_URL, "TEST_DATABASE_URL not set")
+class SubscriberSettingsDbTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.db = Database(TEST_URL)
+        cls.db.connect()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.db.close()
+
+    def setUp(self):
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE subscribers RESTART IDENTITY")
+
+    def test_new_subscriber_gets_quiet_hours_by_default(self):
+        self.db.add_subscriber(1, 'a')
+        s = self.db.get_settings(1)
+        self.assertEqual((s.quiet_enabled, s.quiet_from, s.quiet_to, s.notify_mode),
+                         (True, time(23), time(7), 'all'))
+
+    def test_update_settings(self):
+        self.db.add_subscriber(1, 'a')
+        self.db.update_settings(1, quiet_enabled=False, notify_mode='off_only',
+                                quiet_from=time(22), quiet_to=time(7))
+        s = self.db.get_settings(1)
+        self.assertEqual((s.quiet_enabled, s.notify_mode, s.quiet_from),
+                         (False, 'off_only', time(22)))
+
+    def test_update_rejects_unknown_fields_and_modes(self):
+        self.db.add_subscriber(1, 'a')
+        with self.assertRaises(ValueError):
+            self.db.update_settings(1, is_active=False)
+        with self.assertRaises(Exception):
+            self.db.update_settings(1, notify_mode='sometimes')
+
+    def test_settings_of_active_subscribers_only(self):
+        self.db.add_subscriber(1, 'a')
+        self.db.add_subscriber(2, 'b')
+        self.db.remove_subscriber(2)
+        self.assertEqual([s.chat_id for s in self.db.get_subscriber_settings()], [1])
+
+    def test_unknown_chat_has_no_settings(self):
+        self.assertIsNone(self.db.get_settings(999))
+
+    def test_migration_is_idempotent_for_existing_rows(self):
+        self.db.add_subscriber(1, 'a')
+        self.db._create_tables()
+        self.assertEqual(self.db.get_settings(1).quiet_from, time(23))
 
 
 if __name__ == '__main__':

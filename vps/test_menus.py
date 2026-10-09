@@ -18,7 +18,11 @@ class MenusTest(unittest.TestCase):
     def test_public_commands(self):
         self.assertEqual([c.command for c in menus.PUBLIC_COMMANDS],
                          ['status', 'grid', 'history', 'subscribe',
-                          'unsubscribe', 'help'])
+                          'unsubscribe', 'settings', 'help'])
+
+    def test_public_keyboard_has_settings_button(self):
+        self.assertIn(menus.BTN_SETTINGS, labels(menus.public_keyboard()))
+        self.assertEqual(menus.PUBLIC_BUTTONS[menus.BTN_SETTINGS], 'settings')
 
     def test_private_commands(self):
         self.assertEqual([c.command for c in menus.PRIVATE_COMMANDS],
