@@ -8,6 +8,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 import graphs
+from schedule import PlannedOutage
 from stats import KYIV_TZ, HeatRow, Interval
 
 UTC = timezone.utc
@@ -113,6 +114,58 @@ class HeatmapTest(unittest.TestCase):
         self.assertTrue(graphs.to_png(fig).startswith(b'\x89PNG'))
 
 
+def plan_bars(fig):
+    """(x, width) of planned-outage bars, by row y"""
+    out = []
+    for c in fig.axes[0].collections:
+        if c.get_gid() != 'plan':
+            continue
+        for path in c.get_paths():
+            xs = [v[0] for v in path.vertices]
+            ys = [v[1] for v in path.vertices]
+            out.append((round(min(xs), 2), round(max(xs) - min(xs), 2), round(min(ys), 2)))
+    return sorted(out)
+
+
+class PlanLaneTest(unittest.TestCase):
+    PLAN = [PlannedOutage(K(2026, 10, 9, 9), K(2026, 10, 9, 12, 30)),
+            PlannedOutage(K(2026, 10, 9, 18), K(2026, 10, 9, 22))]
+
+    def week(self, planned):
+        now = K(2026, 10, 9, 12)
+        ivs = [Interval('on', K(2026, 10, 1), now, ongoing=True)]
+        return graphs.build_timeline_figure(ivs, K(2026, 10, 3), now, '7d',
+                                            planned=planned)
+
+    def test_day_rows_show_the_whole_day_plan_including_the_future(self):
+        bars = plan_bars(self.week(self.PLAN))
+        # today is the 7th row (index 6); 18:00-22:00 is still ahead
+        self.assertEqual([(x, w) for x, w, _ in bars], [(9.0, 3.5), (18.0, 4.0)])
+        self.assertTrue(all(6 < y < 7 for _, _, y in bars))
+
+    def test_plan_legend_entry(self):
+        fig = self.week(self.PLAN)
+        labels = [t.get_text() for t in fig.axes[0].get_legend().get_texts()]
+        self.assertIn('за графіком', labels)
+
+    def test_no_plan_lane_without_schedule(self):
+        fig = self.week(None)
+        self.assertEqual(plan_bars(fig), [])
+        labels = [t.get_text() for t in fig.axes[0].get_legend().get_texts()]
+        self.assertNotIn('за графіком', labels)
+
+    def test_day_band_plan_clipped_to_window(self):
+        now = K(2026, 10, 9, 12)
+        fig = graphs.build_timeline_figure([], now - timedelta(hours=24), now, '24h',
+                                           planned=self.PLAN)
+        (bar,) = plan_bars(fig)
+        x0, width, _ = bar
+        nine = graphs.mdates.date2num(K(2026, 10, 9, 9))
+        self.assertAlmostEqual(x0, round(nine, 2))
+        self.assertAlmostEqual(width, round(3 / 24, 2))  # 09:00-12:00, until now
+        self.assertTrue(graphs.to_png(fig).startswith(b'\x89PNG'))
+
+
 class LayoutTest(unittest.TestCase):
     def assert_legend_clear_of_title(self, fig):
         fig.canvas.draw()
@@ -128,6 +181,14 @@ class LayoutTest(unittest.TestCase):
         ivs = [Interval('on', K(2026, 10, 1), now, ongoing=True)]
         self.assert_legend_clear_of_title(
             graphs.build_timeline_figure(ivs, K(2026, 10, 3), now, '7d'))
+
+    def test_legend_with_plan_does_not_cover_title(self):
+        now = K(2026, 10, 9, 12)
+        plan = PlanLaneTest.PLAN
+        self.assert_legend_clear_of_title(graphs.build_timeline_figure(
+            [], K(2026, 10, 3), now, '7d', planned=plan))
+        self.assert_legend_clear_of_title(graphs.build_timeline_figure(
+            [], now - timedelta(hours=24), now, '24h', planned=plan))
 
     def test_timeline_day_legend_does_not_cover_title(self):
         now = K(2026, 10, 9, 12)

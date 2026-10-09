@@ -5,11 +5,12 @@ Run: python -m unittest test_charts
 
 import asyncio
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import charts
-from stats import Interval
+from schedule import APPLIES, EMERGENCY, DaySchedule, PlannedOutage
+from stats import KYIV_TZ, Interval
 
 NOW = datetime(2026, 10, 9, 12, tzinfo=timezone.utc)
 
@@ -89,6 +90,44 @@ class RenderTest(unittest.TestCase):
         db = FakeDb()
         charts.render_chart('battery', '7d', now=NOW, db=db)
         self.assertIn(('history', 168), db.calls)
+
+
+class TimelinePlanTest(unittest.TestCase):
+    def render(self, db, group='16.1', period='7d'):
+        real = charts.graphs.build_timeline_figure
+        with patch.object(charts.config, 'DTEK_GROUP', group), \
+             patch.object(charts.graphs, 'build_timeline_figure',
+                          side_effect=real) as build:
+            png = charts.render_chart('timeline', period, now=NOW, db=db)
+        self.assertTrue(png.startswith(b'\x89PNG'))
+        return build.call_args.kwargs.get('planned')
+
+    def test_applied_schedule_is_passed_to_the_timeline(self):
+        k = KYIV_TZ
+        db = FakeDb()
+        db.get_schedule = MagicMock(return_value=[
+            DaySchedule(date(2026, 10, 8), EMERGENCY,
+                        (PlannedOutage(datetime(2026, 10, 8, 9, tzinfo=k),
+                                       datetime(2026, 10, 8, 12, tzinfo=k)),)),
+            DaySchedule(date(2026, 10, 9), APPLIES,
+                        (PlannedOutage(datetime(2026, 10, 9, 18, tzinfo=k),
+                                       datetime(2026, 10, 9, 22, tzinfo=k)),)),
+        ])
+        planned = self.render(db)
+        self.assertEqual([o.start.hour for o in planned], [18])
+        group, first, last = db.get_schedule.call_args.args
+        self.assertEqual((group, first, last), ('16.1', date(2026, 10, 3), date(2026, 10, 9)))
+
+    def test_schedule_failure_keeps_the_chart(self):
+        db = FakeDb()
+        db.get_schedule = MagicMock(side_effect=RuntimeError("db down"))
+        self.assertIsNone(self.render(db))
+
+    def test_no_schedule_without_group(self):
+        db = FakeDb()
+        db.get_schedule = MagicMock()
+        self.assertIsNone(self.render(db, group=''))
+        db.get_schedule.assert_not_called()
 
 
 class CacheTest(unittest.TestCase):

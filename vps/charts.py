@@ -6,6 +6,7 @@ Callback data: "ch:<scope>:<type>:<period>", scope p = private bot, g = public
 """
 
 import asyncio
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
@@ -15,7 +16,10 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 import config
 import graphs
 from database import get_db
-from stats import hourly_heatmap, period_bounds
+from schedule import applied_outages
+from stats import KYIV_TZ, hourly_heatmap, period_bounds
+
+logger = logging.getLogger(__name__)
 
 CHART_TYPES = {
     'p': ['voltage', 'battery', 'load', 'combined', 'timeline', 'heatmap'],
@@ -92,6 +96,19 @@ def _hourly_sample(row: Dict) -> Dict:
             'load_power': row.get('avg_load_power')}
 
 
+def _planned(db, start: datetime, now: datetime) -> Optional[List]:
+    """Planned outages for the timeline; None hides the plan lane"""
+    if not config.DTEK_GROUP:
+        return None
+    try:
+        days = db.get_schedule(config.DTEK_GROUP, start.astimezone(KYIV_TZ).date(),
+                               now.astimezone(KYIV_TZ).date())
+    except Exception as e:
+        logger.warning(f"Failed to load schedule for chart: {type(e).__name__}")
+        return None
+    return applied_outages(days)
+
+
 def render_chart(chart_type: str, period: str, now: datetime = None,
                  db=None) -> bytes:
     """Fetch the data a chart needs and render it to PNG (blocking)"""
@@ -110,7 +127,8 @@ def render_chart(chart_type: str, period: str, now: datetime = None,
         else:
             start = period_bounds('day', PERIOD_DAYS[period], now)[0][0]
         fig = graphs.build_timeline_figure(db.get_intervals(start, now),
-                                           start, now, period)
+                                           start, now, period,
+                                           planned=_planned(db, start, now))
         return graphs.to_png(fig)
 
     start = now - PERIOD_SPAN[period]
