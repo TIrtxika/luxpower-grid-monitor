@@ -7,12 +7,13 @@ Main entry point for bot services
 import logging
 import sys
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 
-# Kyiv timezone (UTC+2, or UTC+3 in summer)
-KYIV_TZ = timezone(timedelta(hours=2))
+# Kyiv timezone (EET/EEST, follows DST)
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 
 def kyiv_now() -> datetime:
@@ -200,7 +201,7 @@ async def callback_history_detail(update: Update, context: ContextTypes.DEFAULT_
     message = "\U0001f4cb Історія подій:\n\n"
 
     for event in grid_events[-10:]:  # Last 10 events
-        ts = event['timestamp'].strftime('%H:%M %d.%m')
+        ts = event['timestamp'].astimezone(KYIV_TZ).strftime('%H:%M %d.%m')
         if event['event_type'] == 'grid_off':
             message += f"\u274c {ts} - Відключено\n"
         else:

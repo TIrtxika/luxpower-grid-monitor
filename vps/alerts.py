@@ -5,11 +5,12 @@ Sends notifications to subscribers and owner
 
 import logging
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from typing import Optional, Dict, List
+from zoneinfo import ZoneInfo
 
-# Kyiv timezone (UTC+2)
-KYIV_TZ = timezone(timedelta(hours=2))
+# Kyiv timezone (EET/EEST, follows DST)
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 
 def kyiv_now() -> datetime:
