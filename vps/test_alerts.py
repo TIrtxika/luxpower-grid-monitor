@@ -282,6 +282,24 @@ class ScheduleAlertTest(unittest.TestCase):
         self.assertEqual(private.send_message.await_args.kwargs['chat_id'], 42)
         self.assertEqual(channel.notices[0].title, "Відключення за графіком о 18:00")
 
+    def test_owner_who_turned_reminders_off_gets_none(self):
+        day = datetime(2026, 10, 9, 17, 30, tzinfo=alerts.KYIV_TZ)
+        _, private, channel, _ = self.remind(subs(42, remind_enabled=False), day)
+        private.send_message.assert_not_awaited()
+        self.assertEqual(channel.notices, [])
+
+    def test_owner_quiet_hours_default_when_not_subscribed(self):
+        night = datetime(2026, 10, 9, 23, 30, tzinfo=alerts.KYIV_TZ)
+        _, private, channel, _ = self.remind([], night)
+        self.assertTrue(private.send_message.await_args.kwargs['disable_notification'])
+        self.assertEqual(channel.notices[0].priority, alerts.PRIORITY_LOW)
+
+    def test_owner_reminder_loud_by_day(self):
+        day = datetime(2026, 10, 9, 17, 30, tzinfo=alerts.KYIV_TZ)
+        _, private, channel, _ = self.remind([], day)
+        self.assertFalse(private.send_message.await_args.kwargs['disable_notification'])
+        self.assertEqual(channel.notices[0].priority, alerts.PRIORITY_DEFAULT)
+
     def test_reminder_silent_in_quiet_hours(self):
         night = datetime(2026, 10, 9, 23, 30, tzinfo=alerts.KYIV_TZ)
         public, _, _, _ = self.remind([Settings(1)], night)
