@@ -7,7 +7,8 @@ Main entry point for bot services
 import logging
 import sys
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import requests
@@ -20,7 +21,7 @@ def kyiv_now() -> datetime:
     """Get current time in Kyiv timezone"""
     return datetime.now(KYIV_TZ)
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes, MessageHandler, filters
@@ -29,7 +30,13 @@ from telegram.ext import (
 import config
 from database import get_db, close_db
 from poller import get_poller
-from alerts import AlertManager
+from alerts import AlertManager, UNKNOWN_REASONS_UA
+from grid_state import ON, OFF
+import stats as grid_stats
+from messages import (
+    format_history_summary, format_outages, format_periods, format_since,
+    format_stats,
+)
 import graphs
 
 # Logging setup
@@ -40,28 +47,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-def format_duration(delta: timedelta) -> str:
-    """Format duration: minutes -> hours -> days (>7d)"""
-    total_seconds = int(delta.total_seconds())
-    if total_seconds < 60:
-        return f"{total_seconds} сек"
-
-    total_minutes = total_seconds // 60
-    days = total_seconds // 86400
-
-    if days >= 7:
-        return f"{days} дн."
-
-    total_hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-
-    if total_hours >= 1:
-        if minutes > 0:
-            return f"{total_hours} год {minutes} хв"
-        return f"{total_hours} год"
-
-    return f"{total_minutes} хв"
+# httpx logs full Telegram URLs (with the bot token) at INFO
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 # =============================================================================
@@ -106,76 +94,46 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /status command"""
     poller = get_poller()
     status = poller.get_last_status()
+    state = poller.get_effective_state()
 
-    if not status:
+    if state is None:
         await update.message.reply_text(
-            "\u26a0 Дані недоступні. Спробуйте пізніше."
+            "⚠ Дані недоступні. Спробуйте пізніше."
         )
         return
 
-    grid = status.get('grid', {})
-    grid_available = grid.get('available', False)
-    voltage = grid.get('voltage', 0)
-
-    if grid_available:
-        emoji = "\u2705"
-        state_text = "УВІМКНЕНО"
+    voltage = ((status or {}).get('grid') or {}).get('voltage', 0)
+    if state == ON:
+        message = f"✅ Електромережа: УВІМКНЕНО\nНапруга: {voltage}V"
+    elif state == OFF:
+        message = f"❌ Електромережа: ВИМКНЕНО\nНапруга: {voltage}V"
     else:
-        emoji = "\u274c"
-        state_text = "ВИМКНЕНО"
+        reason = UNKNOWN_REASONS_UA.get(poller.get_state_reason(),
+                                        "невідома причина")
+        message = f"⚠️ Немає свіжих даних про мережу\nПричина: {reason}"
 
-    message = f"{emoji} Електромережа: {state_text}\n"
-    message += f"Напруга: {voltage}V"
-
-    # Показати з якого часу поточний стан та тривалість
     try:
-        db = get_db()
-        event_type = 'grid_on' if grid_available else 'grid_off'
-        events = db.get_events(event_type=event_type, hours=24 * 365, limit=1)
-        if events:
-            event_time = events[0]['timestamp']
-            now = kyiv_now()
-            # Конвертуємо в Kyiv TZ для відображення
-            event_time_kyiv = event_time.astimezone(KYIV_TZ)
-            duration = now - event_time_kyiv
-
-            # Формат часу: HH:MM якщо сьогодні, HH:MM DD.MM якщо інший день
-            if event_time_kyiv.date() == now.date():
-                time_str = event_time_kyiv.strftime('%H:%M')
-            else:
-                time_str = event_time_kyiv.strftime('%H:%M %d.%m')
-
-            duration_str = format_duration(duration)
-            message += f"\nЗ {time_str} ({duration_str})"
+        open_iv = get_db().get_open_interval()
+        if open_iv:
+            message += "\n" + format_since(open_iv['started_at'],
+                                           datetime.now(timezone.utc))
     except Exception as e:
-        logger.warning(f"Failed to get grid event for status: {e}")
+        logger.warning(f"Failed to get open interval for status: {e}")
 
     message += f"\n\nОновлено: {kyiv_now().strftime('%H:%M:%S')}"
-
-    if not poller.is_rpi_available():
-        message += "\n\n\u26a0\ufe0f RPi недоступний, дані можуть бути застарілими"
-
     await update.message.reply_text(message)
 
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /history command"""
-    db = get_db()
-    stats = db.get_grid_statistics(hours=24)
+    """Handle /history command: last 24 hours"""
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=24)
+    intervals = get_db().get_intervals(start, now)
+    message = format_history_summary(
+        grid_stats.window_stats(intervals, start, now),
+        grid_stats.outages(intervals, start, now),
+    )
 
-    count = stats['outage_count']
-    duration = stats['total_duration_minutes']
-
-    if count == 0:
-        message = "\u2705 За останні 24 години відключень не було!"
-    else:
-        message = (
-            f"\U0001f4ca Статистика за 24 години:\n\n"
-            f"Відключень: {count}\n"
-            f"Загальний час без світла: {duration} хв"
-        )
-
-    # Add button to get detailed history
     keyboard = [[
         InlineKeyboardButton("Детальніше", callback_data="history_detail")
     ]]
@@ -185,34 +143,16 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def callback_history_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle history detail callback"""
+    """Handle history detail callback: outages of the last 7 days"""
     query = update.callback_query
     await query.answer()
 
-    db = get_db()
-    events = db.get_events(hours=24)
-
-    grid_events = [e for e in events if e['event_type'] in ('grid_on', 'grid_off')]
-
-    if not grid_events:
-        await query.edit_message_text("Подій немає.")
-        return
-
-    message = "\U0001f4cb Історія подій:\n\n"
-
-    for event in grid_events[-10:]:  # Last 10 events
-        ts = event['timestamp'].astimezone(KYIV_TZ).strftime('%H:%M %d.%m')
-        if event['event_type'] == 'grid_off':
-            message += f"\u274c {ts} - Відключено\n"
-        else:
-            duration = event.get('data', {}).get('duration_seconds', 0)
-            if duration:
-                mins = duration // 60
-                message += f"\u2705 {ts} - Увімкнено (було вимкнено {mins} хв)\n"
-            else:
-                message += f"\u2705 {ts} - Увімкнено\n"
-
-    await query.edit_message_text(message)
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=7)
+    intervals = get_db().get_intervals(start, now)
+    await query.edit_message_text(
+        format_outages(grid_stats.outages(intervals, start, now))
+    )
 
 
 async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -253,97 +193,31 @@ async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # GRID AVAILABILITY STATS
 # =============================================================================
 
-DAYS_UA = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Нд']
-MONTHS_UA = [
-    '', 'Січень', 'Лютий', 'Березень', 'Квітень', 'Травень', 'Червень',
-    'Липень', 'Серпень', 'Вересень', 'Жовтень', 'Листопад', 'Грудень'
-]
+# Button period -> number of periods shown
+GRID_VIEWS = {'day': 7, 'week': 5, 'month': 12}
 
 
-def _make_bar(on_pct: float, width: int = 16) -> str:
-    """Visual bar: on=filled, off=empty"""
-    on_blocks = round(on_pct / 100 * width)
-    return "\u2588" * on_blocks + "\u2591" * (width - on_blocks)
+def _grid_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Тиждень", callback_data="grid_day"),
+        InlineKeyboardButton("Місяць", callback_data="grid_week"),
+        InlineKeyboardButton("Рік", callback_data="grid_month"),
+    ]])
 
 
-def _format_grid_stats(stats: list, period_type: str) -> str:
-    """Format grid availability stats with visual bars.
-
-    period_type: 'day', 'week', 'month'
-    """
-    if not stats:
-        return "\u26a0 Недостатньо даних"
-
-    lines = []
-    total_on = 0
-    total_hours = 0
-
-    for row in stats:
-        period = row['period']
-        on_count = row['on_count'] or 0
-        total = row['total'] or 1
-
-        on_pct = on_count / total * 100
-
-        if period_type == 'day':
-            period_hours = 24.0
-            day_name = DAYS_UA[period.weekday()]
-            label = f"{day_name} {period.strftime('%d.%m')}"
-        elif period_type == 'week':
-            period_hours = 168.0
-            week_end = period + timedelta(days=6)
-            label = f"{period.strftime('%d.%m')}-{week_end.strftime('%d.%m')}"
-        else:  # month
-            # Actual days in this month
-            if period.month == 12:
-                next_month = period.replace(year=period.year + 1, month=1)
-            else:
-                next_month = period.replace(month=period.month + 1)
-            days_in_month = (next_month - period).days
-            period_hours = days_in_month * 24.0
-            label = f"{MONTHS_UA[period.month]} {period.year}"
-
-        on_hours = period_hours * on_count / total
-        off_hours = period_hours - on_hours
-        total_on += on_hours
-        total_hours += period_hours
-
-        bar = _make_bar(on_pct)
-        lines.append(f"{label:<12} {bar} {on_hours:.1f}/{off_hours:.1f}")
-
-    # Header
-    if period_type == 'day':
-        title = "\U0001f4ca Електромережа за тиждень"
-    elif period_type == 'week':
-        title = "\U0001f4ca Електромережа за місяць"
-    else:
-        title = "\U0001f4ca Електромережа за рік"
-
-    body = "\n".join(lines)
-
-    if total_hours > 0:
-        pct = total_on / total_hours * 100
-        summary = f"\nВсього: {total_on:.1f} з {total_hours:.0f} год ({pct:.1f}%)"
-    else:
-        summary = ""
-
-    return f"{title}\n\n{body}\n{summary}\n\n\u2588 є світло  \u2591 немає"
+def _grid_message(period: str) -> str:
+    count = GRID_VIEWS[period]
+    now = datetime.now(timezone.utc)
+    first_start = grid_stats.period_bounds(period, count, now)[0][0]
+    intervals = get_db().get_intervals(first_start, now)
+    periods = grid_stats.split_by_periods(intervals, period, count, now)
+    return format_periods(periods, period)
 
 
 async def cmd_grid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /grid command — grid availability statistics"""
-    db = get_db()
-    stats = db.get_daily_grid_stats(days=7)
-    message = _format_grid_stats(stats, 'day')
-
-    keyboard = [[
-        InlineKeyboardButton("Тиждень", callback_data="grid_day"),
-        InlineKeyboardButton("Місяць", callback_data="grid_week"),
-        InlineKeyboardButton("Рік", callback_data="grid_month"),
-    ]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(message, reply_markup=reply_markup)
+    await update.message.reply_text(_grid_message('day'),
+                                    reply_markup=_grid_keyboard())
 
 
 async def callback_grid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -351,26 +225,11 @@ async def callback_grid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    period_type = query.data.replace("grid_", "")
-    db = get_db()
-
-    if period_type == 'day':
-        stats = db.get_daily_grid_stats(days=7)
-    elif period_type == 'week':
-        stats = db.get_weekly_grid_stats(weeks=4)
-    else:
-        stats = db.get_monthly_grid_stats(months=6)
-
-    message = _format_grid_stats(stats, period_type)
-
-    keyboard = [[
-        InlineKeyboardButton("Тиждень", callback_data="grid_day"),
-        InlineKeyboardButton("Місяць", callback_data="grid_week"),
-        InlineKeyboardButton("Рік", callback_data="grid_month"),
-    ]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(message, reply_markup=reply_markup)
+    period = query.data.replace("grid_", "")
+    if period not in GRID_VIEWS:
+        return
+    await query.edit_message_text(_grid_message(period),
+                                  reply_markup=_grid_keyboard())
 
 
 # =============================================================================
@@ -500,23 +359,21 @@ async def callback_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /stats command (private bot)"""
-    db = get_db()
+    now = datetime.now(timezone.utc)
+    windows = [("За 24 години", timedelta(hours=24)),
+               ("За 7 днів", timedelta(days=7)),
+               ("За 30 днів", timedelta(days=30))]
+    intervals = get_db().get_intervals(now - windows[-1][1], now)
 
-    # Get statistics for different periods
-    stats_24h = db.get_grid_statistics(hours=24)
-    stats_7d = db.get_grid_statistics(hours=168)
+    rows = []
+    for label, length in windows:
+        start = now - length
+        rows.append((label,
+                     grid_stats.window_stats(intervals, start, now),
+                     grid_stats.outage_summary(
+                         grid_stats.outages(intervals, start, now))))
 
-    message = (
-        "\U0001f4ca Статистика відключень\n\n"
-        "За 24 години:\n"
-        f"  Відключень: {stats_24h['outage_count']}\n"
-        f"  Загалом: {stats_24h['total_duration_minutes']} хв\n\n"
-        "За 7 днів:\n"
-        f"  Відключень: {stats_7d['outage_count']}\n"
-        f"  Загалом: {stats_7d['total_duration_minutes']} хв"
-    )
-
-    await update.message.reply_text(message)
+    await update.message.reply_text(format_stats(rows))
 
 
 @owner_only
@@ -534,19 +391,54 @@ async def cmd_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # =============================================================================
 
+async def _init_owner_bot(owner_bot: Bot) -> Optional[Bot]:
+    """Initialize the private bot used for owner alerts, None if it fails.
+
+    Only the exception type is logged: InvalidToken's message contains the token.
+    """
+    try:
+        await owner_bot.initialize()
+        return owner_bot
+    except Exception as e:
+        logger.error(f"Private bot unavailable for owner alerts: "
+                     f"{type(e).__name__}")
+        return None
+
+
 def run_public_bot():
     """Run public bot only"""
     logger.info("Starting public bot...")
 
     # Initialize database
-    db = get_db()
-
-    # Initialize poller
+    get_db()
     poller = get_poller()
-    poller.start()
+    private_bot = Bot(config.PRIVATE_BOT_TOKEN)
 
-    # Create application
-    app = Application.builder().token(config.PUBLIC_BOT_TOKEN).build()
+    async def on_start(application: Application):
+        """Wire alerts and start polling once the bot loop is running"""
+        alert_manager = AlertManager(application.bot,
+                                     await _init_owner_bot(private_bot))
+        alert_manager.set_event_loop(asyncio.get_running_loop())
+        poller.add_state_callback(alert_manager.on_grid_change)
+        poller.add_unknown_callback(alert_manager.on_unknown_change)
+        poller.start()
+
+    async def on_stop(application: Application):
+        """Stop polling while the bot's HTTP client is still open"""
+        poller.stop()
+
+    async def on_shutdown(application: Application):
+        try:
+            await private_bot.shutdown()
+        except Exception as e:
+            logger.warning(f"Private bot shutdown: {type(e).__name__}")
+
+    app = (Application.builder()
+           .token(config.PUBLIC_BOT_TOKEN)
+           .post_init(on_start)
+           .post_stop(on_stop)
+           .post_shutdown(on_shutdown)
+           .build())
 
     # Add handlers
     app.add_handler(CommandHandler("start", cmd_start))
@@ -560,19 +452,11 @@ def run_public_bot():
     app.add_handler(CallbackQueryHandler(callback_history_detail, pattern="^history_"))
     app.add_handler(CallbackQueryHandler(callback_grid, pattern="^grid_"))
 
-    # Setup alerts
-    alert_manager = AlertManager(app.bot)
-    alert_manager.set_event_loop(asyncio.get_event_loop())
-    poller.add_state_callback(alert_manager.on_grid_state_change)
-    poller.add_rpi_callback(alert_manager.on_rpi_state_change)
-
     logger.info("Public bot started")
 
     # Run
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    # Cleanup
-    poller.stop()
     close_db()
 
 

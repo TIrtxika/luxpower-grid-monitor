@@ -5,7 +5,7 @@ PostgreSQL storage for inverter data and events
 
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from contextlib import contextmanager
 
 import psycopg2
@@ -13,6 +13,7 @@ from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 
 import config
+from stats import Interval
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,24 @@ class Database:
                     );
                 """)
 
+                # Таблиця інтервалів стану мережі
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS grid_intervals (
+                        id SERIAL PRIMARY KEY,
+                        state TEXT NOT NULL
+                            CHECK (state IN ('on', 'off', 'unknown')),
+                        started_at TIMESTAMPTZ NOT NULL,
+                        ended_at TIMESTAMPTZ NULL,
+                        last_seen_at TIMESTAMPTZ NOT NULL
+                    );
+
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_grid_intervals_open
+                    ON grid_intervals ((ended_at IS NULL)) WHERE ended_at IS NULL;
+
+                    CREATE INDEX IF NOT EXISTS idx_grid_intervals_started
+                    ON grid_intervals (started_at);
+                """)
+
                 logger.info("Database tables created/verified")
 
     # =========================================================================
@@ -196,6 +215,177 @@ class Database:
                 return [dict(row) for row in cur.fetchall()]
 
     # =========================================================================
+    # GRID INTERVALS
+    # =========================================================================
+
+    def get_open_interval(self) -> Optional[Dict]:
+        """Current (open) grid state interval"""
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT state, started_at, last_seen_at FROM grid_intervals
+                    WHERE ended_at IS NULL
+                """)
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def get_last_known_state(self) -> Optional[str]:
+        """Latest 'on'/'off' state, ignoring unknown intervals"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT state FROM grid_intervals
+                    WHERE state <> 'unknown'
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                """)
+                row = cur.fetchone()
+                return row[0] if row else None
+
+    def heartbeat(self, now: datetime) -> int:
+        """Mark the open interval as still observed; 0 = no open interval"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE grid_intervals SET last_seen_at = %s
+                    WHERE ended_at IS NULL
+                """, (now,))
+                return cur.rowcount
+
+    def switch_state(self, state: str, at: datetime,
+                     now: datetime) -> Optional[Dict]:
+        """Close the open interval at `at` and open a new one in `state`.
+
+        Returns the closed interval (state, started_at, ended_at) or None.
+        """
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT id, state, started_at FROM grid_intervals
+                    WHERE ended_at IS NULL
+                    FOR UPDATE
+                """)
+                row = cur.fetchone()
+
+                if row and row['state'] == state:
+                    cur.execute("""
+                        UPDATE grid_intervals SET last_seen_at = %s
+                        WHERE id = %s
+                    """, (now, row['id']))
+                    return None
+
+                closed = None
+                boundary = at
+                if row:
+                    # Boundary never goes before the start of the open interval
+                    boundary = max(at, row['started_at'])
+                    cur.execute("""
+                        UPDATE grid_intervals
+                        SET ended_at = %s,
+                            last_seen_at = GREATEST(last_seen_at, %s)
+                        WHERE id = %s
+                    """, (boundary, boundary, row['id']))
+                    closed = {'state': row['state'],
+                              'started_at': row['started_at'],
+                              'ended_at': boundary}
+
+                cur.execute("""
+                    INSERT INTO grid_intervals (state, started_at, last_seen_at)
+                    VALUES (%s, %s, %s)
+                """, (state, boundary, max(now, boundary)))
+                return closed
+
+    def recover_gap(self, now: datetime,
+                    max_gap: timedelta) -> Optional[Tuple[datetime, datetime]]:
+        """Record monitoring downtime as unknown.
+
+        If the open interval was last seen more than `max_gap` ago, close it
+        at last_seen_at and open 'unknown' from there. Returns (start, now).
+        """
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT id, state, last_seen_at FROM grid_intervals
+                    WHERE ended_at IS NULL
+                    FOR UPDATE
+                """)
+                row = cur.fetchone()
+                if not row or now - row['last_seen_at'] <= max_gap:
+                    return None
+
+                gap_start = row['last_seen_at']
+                if row['state'] == 'unknown':
+                    cur.execute("""
+                        UPDATE grid_intervals SET last_seen_at = %s
+                        WHERE id = %s
+                    """, (now, row['id']))
+                else:
+                    cur.execute("""
+                        UPDATE grid_intervals SET ended_at = last_seen_at
+                        WHERE id = %s
+                    """, (row['id'],))
+                    cur.execute("""
+                        INSERT INTO grid_intervals (state, started_at, last_seen_at)
+                        VALUES ('unknown', %s, %s)
+                    """, (gap_start, now))
+                return gap_start, now
+
+    def get_intervals(self, start: datetime, end: datetime) -> List[Interval]:
+        """Intervals overlapping [start, end); the open one ends at NOW()"""
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT state, started_at,
+                           COALESCE(ended_at, NOW()) AS ended_at,
+                           ended_at IS NULL AS ongoing
+                    FROM grid_intervals
+                    WHERE started_at < %s AND COALESCE(ended_at, NOW()) > %s
+                    ORDER BY started_at
+                """, (end, start))
+                return [Interval(row['state'], row['started_at'],
+                                 row['ended_at'], row['ongoing'])
+                        for row in cur.fetchall()]
+
+    def count_intervals(self) -> int:
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM grid_intervals")
+                return cur.fetchone()[0]
+
+    def get_state_samples(self) -> List[Dict]:
+        """All stored samples (time, connected, grid flag), oldest first"""
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT timestamp, connected, grid_available
+                    FROM inverter_status
+                    ORDER BY timestamp
+                """)
+                return [dict(row) for row in cur.fetchall()]
+
+    @staticmethod
+    def _insert_closed(cur, rows: List[Dict]):
+        cur.executemany("""
+            INSERT INTO grid_intervals
+                (state, started_at, ended_at, last_seen_at)
+            VALUES (%s, %s, %s, %s)
+        """, [(r['state'], r['started_at'], r['ended_at'], r['ended_at'])
+              for r in rows])
+
+    def insert_intervals(self, rows: List[Dict]):
+        """Insert closed intervals (migration)"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                self._insert_closed(cur, rows)
+
+    def replace_intervals(self, rows: List[Dict]):
+        """Wipe grid_intervals and insert `rows` in one transaction"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE grid_intervals RESTART IDENTITY")
+                self._insert_closed(cur, rows)
+
+    # =========================================================================
     # EVENTS METHODS
     # =========================================================================
 
@@ -233,67 +423,6 @@ class Database:
                         LIMIT %s
                     """, (hours, limit))
                 return [dict(row) for row in cur.fetchall()]
-
-    def get_grid_statistics(self, hours: int = 24) -> Dict:
-        """Calculate grid outage statistics"""
-        events = self.get_events(hours=hours)
-
-        grid_events = [e for e in events if e['event_type'] in ('grid_on', 'grid_off')]
-
-        outage_count = 0
-        total_duration = 0
-
-        for event in grid_events:
-            if event['event_type'] == 'grid_on':
-                outage_count += 1
-                duration = event.get('data', {}).get('duration_seconds', 0)
-                if duration:
-                    total_duration += duration
-
-        return {
-            'period_hours': hours,
-            'outage_count': outage_count,
-            'total_duration_seconds': total_duration,
-            'total_duration_minutes': round(total_duration / 60, 1)
-        }
-
-    # =========================================================================
-    # GRID AVAILABILITY STATS
-    # =========================================================================
-
-    def _get_grid_stats_by_period(self, trunc: str, interval: str) -> List[Dict]:
-        """Get grid availability grouped by time period.
-
-        Args:
-            trunc: PostgreSQL date_trunc unit ('day', 'week', 'month')
-            interval: PostgreSQL interval string ('7 days', '4 weeks', '6 months')
-        """
-        with self.get_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(f"""
-                    SELECT
-                        date_trunc('{trunc}', timestamp) as period,
-                        COUNT(*) FILTER (WHERE grid_available = true) as on_count,
-                        COUNT(*) FILTER (WHERE grid_available = false) as off_count,
-                        COUNT(*) as total
-                    FROM inverter_status
-                    WHERE timestamp > NOW() - INTERVAL '{interval}'
-                    GROUP BY period
-                    ORDER BY period
-                """)
-                return [dict(row) for row in cur.fetchall()]
-
-    def get_daily_grid_stats(self, days: int = 7) -> List[Dict]:
-        """Grid availability per day for the last N days"""
-        return self._get_grid_stats_by_period('day', f'{days} days')
-
-    def get_weekly_grid_stats(self, weeks: int = 4) -> List[Dict]:
-        """Grid availability per week for the last N weeks"""
-        return self._get_grid_stats_by_period('week', f'{weeks} weeks')
-
-    def get_monthly_grid_stats(self, months: int = 6) -> List[Dict]:
-        """Grid availability per month for the last N months"""
-        return self._get_grid_stats_by_period('month', f'{months} months')
 
     # =========================================================================
     # SUBSCRIBERS METHODS
@@ -347,24 +476,15 @@ class Database:
     # CLEANUP METHODS
     # =========================================================================
 
-    def cleanup_old_data(self, days: int = 30):
-        """Remove data older than specified days"""
+    def cleanup_status(self, days: int) -> int:
+        """Remove inverter_status samples older than `days`"""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     DELETE FROM inverter_status
-                    WHERE timestamp < NOW() - INTERVAL '%s days'
+                    WHERE timestamp < NOW() - make_interval(days => %s)
                 """, (days,))
-                deleted_status = cur.rowcount
-
-                cur.execute("""
-                    DELETE FROM events
-                    WHERE timestamp < NOW() - INTERVAL '%s days'
-                """, (days,))
-                deleted_events = cur.rowcount
-
-                logger.info(f"Cleanup: removed {deleted_status} status records, "
-                           f"{deleted_events} events")
+                return cur.rowcount
 
 
 # Global instance

@@ -1,56 +1,78 @@
 """
 RPi API Poller
-Fetches data from RPi and stores in database
+Fetches data from RPi, tracks the effective grid state (on/off/unknown)
+and records it as intervals in the database
 """
 
 import time
 import logging
 import threading
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Callable, List
 
 import requests
 
 import config
 from database import get_db
+from grid_state import (
+    StateTracker, Transition, GridChange, ON, OFF, UNKNOWN,
+    REASON_MONITOR_DOWNTIME,
+)
 
 logger = logging.getLogger(__name__)
+
+CLEANUP_INTERVAL = 24 * 3600
+
+
+def _dt(ts: float) -> datetime:
+    """Unix time -> aware UTC datetime"""
+    return datetime.fromtimestamp(ts, timezone.utc)
 
 
 class RpiPoller:
     """Polls RPi API for inverter data"""
 
-    def __init__(self):
+    def __init__(self, clock: Callable[[], float] = time.time,
+                 db_factory: Callable = get_db):
         self.api_url = config.RPI_API_URL
         self.api_token = config.RPI_API_TOKEN
         self.poll_interval = config.POLL_INTERVAL
         self.store_interval = config.STORE_INTERVAL
 
+        self._clock = clock
+        self._db_factory = db_factory
+
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._last_status: Optional[Dict] = None
         self._last_store_time: float = 0
-        self._last_grid_state: Optional[bool] = None
+        self._last_cleanup_time: Optional[float] = None
 
-        # Debounce для зміни стану мережі
-        self._pending_grid_state: Optional[bool] = None
-        self._pending_since: float = 0
-
-        # Трекінг доступності RPi
-        self._consecutive_failures: int = 0
-        self._rpi_available: bool = True
-        self._rpi_unavailable_since: float = 0
+        self.tracker = self._new_tracker()
+        self._unsaved: List[Transition] = []
+        self._unknown_alerted = False
+        self._unknown_since: float = 0       # start of the unknown period
+        self._unknown_alert_from: float = 0  # 🟡 alert threshold counts from here
 
         # Callbacks
         self._state_callbacks: List[Callable] = []
-        self._rpi_callbacks: List[Callable] = []
+        self._unknown_callbacks: List[Callable] = []
+
+    def _new_tracker(self, **seed) -> StateTracker:
+        return StateTracker(
+            debounce_s=config.GRID_STATE_DEBOUNCE,
+            unreachable_threshold=config.RPI_UNREACHABLE_THRESHOLD,
+            stale_after_s=config.STALE_DATA_SECONDS,
+            **seed,
+        )
 
     def add_state_callback(self, callback: Callable):
-        """Add callback for grid state changes"""
+        """Add callback(change: GridChange, status) for ON <-> OFF changes"""
         self._state_callbacks.append(callback)
 
-    def add_rpi_callback(self, callback: Callable):
-        """Add callback for RPi availability changes"""
-        self._rpi_callbacks.append(callback)
+    def add_unknown_callback(self, callback: Callable):
+        """Add callback(active, reason, seconds) for unknown-state alerts"""
+        self._unknown_callbacks.append(callback)
 
     def _get_headers(self) -> Dict:
         """Get API request headers"""
@@ -106,128 +128,159 @@ class RpiPoller:
             logger.error(f"Health check failed: {e}")
             return {"status": "error", "error": str(e)}
 
-    def _check_state_change(self, status: Dict):
-        """Check for grid state changes with debounce to avoid false triggers"""
-        grid_available = status.get('grid', {}).get('available')
-
-        if grid_available is None:
+    def init_state(self):
+        """Seed the tracker from the DB and record monitoring downtime"""
+        now = self._clock()
+        try:
+            db = self._db_factory()
+            gap = db.recover_gap(_dt(now),
+                                 timedelta(seconds=3 * self.poll_interval))
+            open_iv = db.get_open_interval()
+            last_known = db.get_last_known_state()
+        except Exception as e:
+            logger.error(f"Failed to load grid state from DB: {e}")
             return
 
-        # First status - just remember
-        if self._last_grid_state is None:
-            self._last_grid_state = grid_available
-            logger.info(f"Initial grid state: {'ON' if grid_available else 'OFF'}")
-            return
-
-        # State matches confirmed state - reset any pending change
-        if grid_available == self._last_grid_state:
-            if self._pending_grid_state is not None:
-                logger.info(f"Pending grid state change cancelled "
-                           f"(was {'ON' if self._pending_grid_state else 'OFF'}, "
-                           f"reverted after {time.time() - self._pending_since:.0f}s)")
-                self._pending_grid_state = None
-                self._pending_since = 0
-            return
-
-        # State differs from confirmed - start or continue debounce
-        now = time.time()
-
-        if self._pending_grid_state != grid_available:
-            # New pending state detected
-            self._pending_grid_state = grid_available
-            self._pending_since = now
-            logger.info(f"Pending grid state change to "
-                       f"{'ON' if grid_available else 'OFF'}, "
-                       f"waiting for debounce ({config.GRID_STATE_DEBOUNCE}s)")
-            return
-
-        # Same pending state - check if debounce period passed
-        elapsed = now - self._pending_since
-        if elapsed >= config.GRID_STATE_DEBOUNCE:
-            old_state = self._last_grid_state
-            self._last_grid_state = grid_available
-            self._pending_grid_state = None
-            self._pending_since = 0
-
-            logger.info(f"Grid state confirmed after {elapsed:.0f}s: "
-                       f"{'ON' if old_state else 'OFF'} -> "
-                       f"{'ON' if grid_available else 'OFF'}")
-
-            for callback in self._state_callbacks:
-                try:
-                    callback(old_state, grid_available, status)
-                except Exception as e:
-                    logger.error(f"State callback error: {e}")
+        if open_iv:
+            self.tracker = self._new_tracker(
+                initial_state=open_iv['state'],
+                initial_since=open_iv['started_at'].timestamp(),
+                last_known=last_known,
+                initial_reason=REASON_MONITOR_DOWNTIME if gap else None,
+            )
         else:
-            logger.debug(f"Debounce in progress: {elapsed:.0f}s / "
-                        f"{config.GRID_STATE_DEBOUNCE}s")
+            self.tracker = self._new_tracker(last_known=last_known)
 
-    def _on_rpi_unavailable(self):
-        """Handle RPi becoming unreachable"""
-        self._rpi_available = False
-        self._rpi_unavailable_since = time.time()
+        if open_iv and open_iv['state'] == UNKNOWN:
+            started = open_iv['started_at'].timestamp()
+            self._unknown_since = started
+            if gap:
+                # The downtime message goes out below; give the 🟡 alert
+                # a fresh threshold from now
+                self._unknown_alert_from = now
+                self._unknown_alerted = False
+            else:
+                # Quick restart: the owner was already alerted if it is old
+                self._unknown_alert_from = started
+                self._unknown_alerted = (now - started
+                                         >= config.UNKNOWN_ALERT_AFTER)
 
-        # Скидаємо debounce — дані ненадійні
-        if self._pending_grid_state is not None:
-            logger.info("Resetting grid debounce due to RPi unavailability")
-            self._pending_grid_state = None
-            self._pending_since = 0
+        if gap:
+            gap_start, gap_end = gap
+            seconds = int((gap_end - gap_start).total_seconds())
+            logger.warning(f"Monitoring was down for {seconds}s, "
+                           f"recorded as unknown")
+            self._fire_unknown(False, REASON_MONITOR_DOWNTIME, seconds)
 
-        logger.warning(f"RPi unreachable after {self._consecutive_failures} "
-                      f"consecutive failures")
-
-        for callback in self._rpi_callbacks:
+    def _fire_unknown(self, active: bool, reason: Optional[str], seconds: int):
+        for callback in self._unknown_callbacks:
             try:
-                callback(False, self._consecutive_failures)
+                callback(active, reason, seconds)
             except Exception as e:
-                logger.error(f"RPi callback error: {e}")
+                logger.error(f"Unknown-state callback error: {e}")
 
-    def _on_rpi_recovered(self):
-        """Handle RPi becoming reachable again"""
-        downtime = int(time.time() - self._rpi_unavailable_since)
-        self._rpi_available = True
-        self._rpi_unavailable_since = 0
+    def _record(self, transition: Optional[Transition],
+                now: float) -> Optional[Dict]:
+        """Write state changes (retrying earlier failures) or a heartbeat"""
+        if transition is not None:
+            self._unsaved.append(transition)
 
-        logger.info(f"RPi recovered after {downtime}s of downtime")
+        db = self._db_factory()
+        closed = None
+        while self._unsaved:
+            t = self._unsaved[0]
+            closed = db.switch_state(t.state, _dt(t.at), _dt(now))
+            self._unsaved.pop(0)
 
-        for callback in self._rpi_callbacks:
+        if transition is None and self.tracker.state is not None:
+            if db.heartbeat(_dt(now)) == 0:
+                # Open interval vanished (e.g. table rewritten): reopen it
+                logger.warning("No open grid interval, reopening current state")
+                db.switch_state(self.tracker.state, _dt(self.tracker.since),
+                                _dt(now))
+        return closed
+
+    def _on_transition(self, t: Transition, closed: Optional[Dict]):
+        logger.info(f"Grid state: {t.previous} -> {t.state}"
+                    + (f" ({t.reason})" if t.reason else ""))
+
+        if t.state == UNKNOWN:
+            self._unknown_since = t.at
+            self._unknown_alert_from = t.at
+        elif t.previous == UNKNOWN and self._unknown_alerted:
+            self._unknown_alerted = False
+            self._fire_unknown(False, None, int(t.at - self._unknown_since))
+
+        if t.state not in (ON, OFF) or t.previous_known in (None, t.state):
+            return
+
+        duration = None
+        if t.state == ON and closed and closed['state'] == OFF:
+            duration = int(t.at - closed['started_at'].timestamp())
+
+        change = GridChange(state=t.state, at=t.at, duration_s=duration,
+                            approximate=(t.previous == UNKNOWN))
+        for callback in self._state_callbacks:
             try:
-                callback(True, downtime)
+                callback(change, self._last_status)
             except Exception as e:
-                logger.error(f"RPi callback error: {e}")
+                logger.error(f"State callback error: {e}")
+
+    def _check_unknown_alert(self, now: float):
+        if (self.tracker.state == UNKNOWN and not self._unknown_alerted
+                and now - self._unknown_alert_from >= config.UNKNOWN_ALERT_AFTER):
+            self._unknown_alerted = True
+            self._fire_unknown(True, self.tracker.reason,
+                               int(now - self.tracker.since))
+
+    def _maybe_store(self, status: Dict, now: float):
+        if now - self._last_store_time < self.store_interval:
+            return
+        try:
+            self._db_factory().save_status(status)
+            self._last_store_time = now
+        except Exception as e:
+            logger.error(f"Failed to store status: {e}")
+
+    def _maybe_cleanup(self, now: float):
+        if (self._last_cleanup_time is not None
+                and now - self._last_cleanup_time < CLEANUP_INTERVAL):
+            return
+        self._last_cleanup_time = now
+        try:
+            deleted = self._db_factory().cleanup_status(config.RETENTION_DAYS)
+            logger.info(f"Retention: removed {deleted} old status rows")
+        except Exception as e:
+            logger.error(f"Retention cleanup failed: {e}")
 
     def _poll_once(self):
         """Single poll iteration"""
+        now = self._clock()
         status = self.fetch_status()
+        if status is not None:
+            self._last_status = status
 
-        if status is None:
-            self._consecutive_failures += 1
-            if (self._rpi_available and
-                    self._consecutive_failures >= config.RPI_UNREACHABLE_THRESHOLD):
-                self._on_rpi_unavailable()
-            return
+        transition = self.tracker.observe(status, now)
 
-        # RPi відповів — скидаємо лічильник помилок
-        if not self._rpi_available:
-            self._on_rpi_recovered()
-        self._consecutive_failures = 0
+        closed = None
+        try:
+            closed = self._record(transition, now)
+        except Exception as e:
+            logger.error(f"Failed to record grid state: {e}")
 
-        self._last_status = status
-        self._check_state_change(status)
+        if transition is not None:
+            self._on_transition(transition, closed)
 
-        # Store to database periodically
-        now = time.time()
-        if now - self._last_store_time >= self.store_interval:
-            try:
-                db = get_db()
-                db.save_status(status)
-                self._last_store_time = now
-            except Exception as e:
-                logger.error(f"Failed to store status: {e}")
+        self._check_unknown_alert(now)
+
+        if status is not None:
+            self._maybe_store(status, now)
+        self._maybe_cleanup(now)
 
     def _run_loop(self):
         """Main polling loop"""
         logger.info(f"Poller started (interval: {self.poll_interval}s)")
+        self.init_state()
 
         while not self._stop_event.is_set():
             try:
@@ -259,13 +312,13 @@ class RpiPoller:
         """Get last fetched status"""
         return self._last_status
 
-    def get_grid_state(self) -> Optional[bool]:
-        """Get current grid state"""
-        return self._last_grid_state
+    def get_effective_state(self) -> Optional[str]:
+        """'on' / 'off' / 'unknown', or None before the first poll"""
+        return self.tracker.state
 
-    def is_rpi_available(self) -> bool:
-        """Check if RPi is currently reachable"""
-        return self._rpi_available
+    def get_state_reason(self) -> Optional[str]:
+        """Why the state is unknown (None otherwise)"""
+        return self.tracker.reason
 
 
 # Global instance

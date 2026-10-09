@@ -48,6 +48,15 @@ GRID_STATE_DEBOUNCE = 120
 # З POLL_INTERVAL=60 значення 3 = RPi недоступний ~3 хвилини
 RPI_UNREACHABLE_THRESHOLD = 3
 
+# Дані RPi старші за це (секунди) вважаються застарілими -> стан "невідомо"
+STALE_DATA_SECONDS = int(os.environ.get("STALE_DATA_SECONDS", "180"))
+
+# Через скільки секунд стану "невідомо" надіслати алерт власнику
+UNKNOWN_ALERT_AFTER = int(os.environ.get("UNKNOWN_ALERT_AFTER", "300"))
+
+# Скільки днів зберігати зразки inverter_status
+RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
+
 # Канал для публічних сповіщень (опціонально)
 PUBLIC_CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL_ID", "")
 

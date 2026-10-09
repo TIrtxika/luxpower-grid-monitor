@@ -126,6 +126,20 @@ sudo systemctl enable --now luxpower-bot-public luxpower-bot-private
 | `DATABASE_URL` | — | PostgreSQL connection string |
 | `GRID_STATE_DEBOUNCE` | 120s | VPS-side debounce (filters false triggers) |
 | `RPI_UNREACHABLE_THRESHOLD` | 3 | Consecutive failures before RPi alert |
+| `STALE_DATA_SECONDS` | 180 | RPi data older than this → state "unknown" (🟡) |
+| `UNKNOWN_ALERT_AFTER` | 300 | Seconds of "unknown" before the owner is alerted |
+| `RETENTION_DAYS` | 90 | Days of `inverter_status` samples to keep |
+
+### Grid state history (`grid_intervals`)
+
+The poller records the grid state as intervals (`on` / `off` / `unknown`).
+Statistics in `/grid`, `/history`, `/stats` are computed from them; time when
+the monitor had no data is shown as "unknown" and excluded from availability %.
+
+One-off backfill from existing samples (run with the public bot stopped):
+
+    python migrate_intervals.py --dry-run
+    python migrate_intervals.py
 
 ## Telegram Commands
 
