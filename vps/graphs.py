@@ -119,9 +119,13 @@ def _style_axes(ax):
     ax.tick_params(colors=COLORS['text'], labelsize=9)
 
 
-def _title(ax, text: str):
+# Title padding (points) that leaves room for a legend between title and plot
+TITLE_PAD_WITH_LEGEND = 30
+
+
+def _title(ax, text: str, pad: float = 10):
     ax.set_title(text, loc='left', fontsize=13, color=COLORS['text'],
-                 fontweight='bold', pad=10)
+                 fontweight='bold', pad=pad)
 
 
 def _time_axis(ax, start: datetime, end: datetime):
@@ -156,12 +160,14 @@ def _empty_note(ax, text: str = "Немає даних за цей період"
             color=COLORS['text'], fontsize=12, alpha=0.7)
 
 
-def _state_legend(ax, loc='upper left'):
+def _state_legend(ax):
+    """Legend in the band between the title and the plot"""
     handles = [Patch(color=COLORS['on'], label='є світло'),
                Patch(color=COLORS['off'], label='немає'),
                Patch(facecolor='white', edgecolor=COLORS['unknown'], hatch='///',
                      label='невідомо')]
-    ax.legend(handles=handles, loc=loc, fontsize=8, frameon=False, ncol=3)
+    ax.legend(handles=handles, loc='lower left', bbox_to_anchor=(0, 1.0),
+              fontsize=8, frameon=False, ncol=3, borderaxespad=0.2)
 
 
 def _draw_metric(ax, metric: str, samples: Sequence[Dict],
@@ -231,9 +237,8 @@ def build_timeline_figure(intervals: Sequence[Interval], start: datetime,
         ax.set_ylim(0, 1)
         ax.set_yticks([])
         _time_axis(ax, start, end)
-        _title(ax, f"Світло — {PERIOD_LABELS[period]}")
-        _state_legend(ax, loc='upper left')
-        ax.legend_.set_bbox_to_anchor((0, -0.35))
+        _title(ax, f"Світло — {PERIOD_LABELS[period]}", pad=TITLE_PAD_WITH_LEGEND)
+        _state_legend(ax)
         return fig
 
     first = start.astimezone(KYIV_TZ).date()
@@ -257,9 +262,8 @@ def build_timeline_figure(intervals: Sequence[Interval], start: datetime,
     ax.set_yticks([i + 0.5 for i in range(len(days))])
     ax.set_yticklabels([f"{DAYS_UA[d.weekday()]} {d:%d.%m}" for d in days])
     ax.grid(False)
-    _title(ax, f"Світло — {PERIOD_LABELS[period]}")
-    _state_legend(ax, loc='lower left')
-    ax.legend_.set_bbox_to_anchor((0, 1.0))
+    _title(ax, f"Світло — {PERIOD_LABELS[period]}", pad=TITLE_PAD_WITH_LEGEND)
+    _state_legend(ax)
     return fig
 
 
@@ -289,7 +293,8 @@ def build_heatmap_figure(rows: Sequence[HeatRow], period: str) -> Figure:
     ax.tick_params(colors=COLORS['text'], labelsize=9, length=0)
     for side in ax.spines.values():
         side.set_visible(False)
-    _title(ax, f"Відключення по годинах — {PERIOD_LABELS[period]}")
+    _title(ax, f"Відключення по годинах — {PERIOD_LABELS[period]}",
+           pad=TITLE_PAD_WITH_LEGEND)
     handles = [Patch(color=COLORS['on'], label='світло було'),
                Patch(color='#f2c94c', label='частково'),
                Patch(color=COLORS['off'], label='не було'),

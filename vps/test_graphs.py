@@ -113,5 +113,31 @@ class HeatmapTest(unittest.TestCase):
         self.assertTrue(graphs.to_png(fig).startswith(b'\x89PNG'))
 
 
+class LayoutTest(unittest.TestCase):
+    def assert_legend_clear_of_title(self, fig):
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        ax = fig.axes[0]
+        # set_title(loc='left') draws into the left title artist, not ax.title
+        title = ax._left_title.get_window_extent(renderer)
+        legend = ax.get_legend().get_window_extent(renderer)
+        self.assertFalse(title.overlaps(legend), (title, legend))
+
+    def test_timeline_week_legend_does_not_cover_title(self):
+        now = K(2026, 10, 9, 12)
+        ivs = [Interval('on', K(2026, 10, 1), now, ongoing=True)]
+        self.assert_legend_clear_of_title(
+            graphs.build_timeline_figure(ivs, K(2026, 10, 3), now, '7d'))
+
+    def test_timeline_day_legend_does_not_cover_title(self):
+        now = K(2026, 10, 9, 12)
+        self.assert_legend_clear_of_title(
+            graphs.build_timeline_figure([], now - timedelta(hours=24), now, '24h'))
+
+    def test_heatmap_legend_does_not_cover_title(self):
+        rows = [HeatRow(K(2026, 10, 9).date(), [0.0] * 24, [0.0] * 24)]
+        self.assert_legend_clear_of_title(graphs.build_heatmap_figure(rows, '30d'))
+
+
 if __name__ == '__main__':
     unittest.main()
