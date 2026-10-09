@@ -83,10 +83,10 @@ class RpiPoller:
         if not group:
             return None
         group_check = None
-        if config.YASNO_STREET_ID and config.YASNO_HOUSE_ID:
+        if config.YASNO_STREET and config.YASNO_HOUSE:
             group_check = functools.partial(
                 fetch_group, config.YASNO_ADDRESSES_URL,
-                config.YASNO_STREET_ID, config.YASNO_HOUSE_ID)
+                config.YASNO_STREET, config.YASNO_HOUSE)
         return ScheduleWatch(
             group,
             lambda: fetch_schedule(config.YASNO_SCHEDULE_URL, group),

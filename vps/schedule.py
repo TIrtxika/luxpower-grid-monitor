@@ -163,15 +163,32 @@ def fetch_schedule(url: str, group: str, timeout: float = 10,
     return parse_group(response.json(), group)
 
 
-def fetch_group(addresses_url: str, street_id: int, house_id: int,
+def fetch_group(addresses_url: str, street: str, house: str,
                 region_id: int = 25, dso_id: int = 902, timeout: float = 10,
                 session=None) -> str:
-    """Current group of an address, e.g. '16.1'"""
-    response = (session or requests).get(
-        f"{addresses_url}/group", timeout=timeout,
-        headers={'User-Agent': 'luxpower-grid-monitor'},
-        params={'regionId': region_id, 'dsoId': dso_id,
-                'streetId': street_id, 'houseId': house_id})
-    response.raise_for_status()
-    data = response.json()
+    """Current group of an address, e.g. '16.1'.
+
+    YASNO re-numbers its address directory, so street and house ids are
+    looked up by name on every call instead of being configured.
+    """
+    http = session or requests
+    base = {'regionId': region_id, 'dsoId': dso_id}
+
+    def get(path, **params):
+        response = http.get(f"{addresses_url}/{path}", timeout=timeout,
+                            headers={'User-Agent': 'luxpower-grid-monitor'},
+                            params={**base, **params})
+        response.raise_for_status()
+        return response.json()
+
+    streets = [s for s in get('streets', query=street)
+               if street.casefold() in s['value'].casefold()]
+    if len(streets) != 1:
+        raise LookupError(f"street not found or ambiguous ({len(streets)} matches)")
+    street_id = streets[0]['id']
+    houses = [h for h in get('houses', streetId=street_id, query=house)
+              if h['value'].casefold() == house.casefold()]
+    if len(houses) != 1:
+        raise LookupError(f"house not found or ambiguous ({len(houses)} matches)")
+    data = get('group', streetId=street_id, houseId=houses[0]['id'])
     return f"{data['group']}.{data['subgroup']}"
