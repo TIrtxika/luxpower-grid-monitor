@@ -42,6 +42,7 @@ from messages import (
     format_periods, format_stats, format_traffic_light, status_from_sample,
 )
 import charts
+from notifiers import Notice, ntfy_from_config
 
 # Logging setup
 logging.basicConfig(
@@ -320,6 +321,7 @@ async def cmd_private_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/chart - Графіки\n"
         "/stats - Статистика відключень\n"
         "/subscribers - Кількість підписників\n"
+        "/ntfytest - Тест сповіщення ntfy\n"
         "/help - Допомога"
     )
     await update.message.reply_text(help_text,
@@ -436,6 +438,24 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+async def cmd_ntfy_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /ntfytest (private bot): check the ntfy subscription"""
+    ntfy = ntfy_from_config()
+    if not ntfy:
+        await update.message.reply_text(
+            "ntfy не налаштовано (NTFY_TOPIC у .env порожній)")
+        return
+    notice = Notice("Тест LuxPower", "Сповіщення ntfy працюють",
+                    tags=('test_tube',))
+    if await asyncio.to_thread(ntfy.send, notice):
+        await update.message.reply_text(
+            "✅ Надіслано в ntfy — перевірте застосунок")
+    else:
+        await update.message.reply_text(
+            "⚠ Не вдалося надіслати в ntfy (деталі в лозі)")
+
+
+@owner_only
 async def cmd_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /subscribers command (private bot)"""
     db = get_db()
@@ -484,8 +504,10 @@ def run_public_bot():
     async def on_start(application: Application):
         """Wire alerts and start polling once the bot loop is running"""
         await _set_commands(application, menus.PUBLIC_COMMANDS)
+        ntfy = ntfy_from_config()
         alert_manager = AlertManager(application.bot,
-                                     await _init_owner_bot(private_bot))
+                                     await _init_owner_bot(private_bot),
+                                     owner_channels=[ntfy] if ntfy else [])
         alert_manager.set_event_loop(asyncio.get_running_loop())
         poller.add_state_callback(alert_manager.on_grid_change)
         poller.add_unknown_callback(alert_manager.on_unknown_change)
@@ -552,6 +574,7 @@ def run_private_bot():
     app.add_handler(CommandHandler("chart", cmd_chart))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("subscribers", cmd_subscribers))
+    app.add_handler(CommandHandler("ntfytest", cmd_ntfy_test))
 
     app.add_handler(CallbackQueryHandler(callback_chart, pattern="^ch:"))
     app.add_handler(MessageHandler(filters.Text(list(menus.PRIVATE_BUTTONS)),

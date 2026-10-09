@@ -22,7 +22,8 @@ class MenusTest(unittest.TestCase):
 
     def test_private_commands(self):
         self.assertEqual([c.command for c in menus.PRIVATE_COMMANDS],
-                         ['status', 'chart', 'stats', 'subscribers', 'help'])
+                         ['status', 'chart', 'stats', 'subscribers', 'ntfytest',
+                          'help'])
 
     def test_public_keyboard_buttons_all_have_actions(self):
         kb = menus.public_keyboard()
