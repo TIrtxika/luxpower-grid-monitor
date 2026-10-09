@@ -4,4 +4,5 @@ After=postgresql.service
 
 [Service]
 Type=oneshot
-ExecStart=/opt/luxpower/ops/backup-db.sh
+# Root runs this: the script must not live under /opt/luxpower (owned by the bot user)
+ExecStart=/usr/local/sbin/luxpower-backup-db
