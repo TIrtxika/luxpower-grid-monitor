@@ -22,7 +22,9 @@ from telegram.error import Forbidden, TelegramError
 
 import config
 from database import get_db
-from notifiers import Notice, PRIORITY_DEFAULT, PRIORITY_HIGH, PRIORITY_LOW
+from notifiers import (
+    Notice, PRIORITY_DEFAULT, PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_URGENT,
+)
 from grid_state import (
     GridChange, ON,
     REASON_RPI_UNREACHABLE, REASON_DONGLE_OFFLINE, REASON_STALE_DATA,
@@ -272,6 +274,32 @@ class AlertManager:
             await self._send_message_async(bot, config.OWNER_CHAT_ID,
                                            f"{emoji} {title}\n{body}")
         await self._notify_owner_channels(Notice(title, body, priority, tags))
+    def on_low_battery(self, level: int, soc: int, forecast):
+        """Poller callback: SOC crossed a threshold during an outage"""
+        self._run_async(self._send_low_battery(level, soc, forecast))
+
+    async def _send_low_battery(self, level: int, soc: int, forecast):
+        """Low battery goes to the owner only (Telegram + channels)"""
+        now = kyiv_now().strftime('%H:%M:%S %d.%m.%Y')
+        title = f"Батарея {soc}%"
+        if forecast is not None:
+            estimate = (f"Вистачить ще ~{format_seconds(int(forecast.seconds_left))} "
+                        f"(−{forecast.rate_per_hour:.0f}%/год)")
+        else:
+            estimate = "Світла немає, прогноз ще недоступний"
+        body = f"{estimate}\n\n{now}"
+
+        if level <= min(config.BATTERY_ALERT_LEVELS):
+            emoji, priority, tags = "\U0001f6a8", PRIORITY_URGENT, ('rotating_light',)
+        else:
+            emoji, priority, tags = "\U0001faab", PRIORITY_HIGH, ('battery',)
+
+        if config.OWNER_CHAT_ID:
+            bot = self.private_bot or self.public_bot
+            await self._send_message_async(bot, config.OWNER_CHAT_ID,
+                                           f"{emoji} {title}\n{body}")
+        await self._notify_owner_channels(Notice(title, body, priority, tags))
+
     async def send_status_to_owner(self, status: Dict):
         """Send status to owner (private bot)"""
         if not self.private_bot or not config.OWNER_CHAT_ID:
