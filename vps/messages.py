@@ -207,6 +207,22 @@ def format_inverter_details(status: Dict) -> str:
     )
 
 
+MODE_TEXT = {'all': "усі зміни", 'off_only': "лише відключення",
+             'on_only': "лише повернення світла"}
+
+
+def format_settings(s) -> str:
+    """/settings text for subscriptions.Settings"""
+    if s.quiet_enabled:
+        quiet = (f"\U0001f515 Тихі години: {s.quiet_from:%H:%M}–{s.quiet_to:%H:%M} "
+                 f"— сповіщення приходять беззвучно")
+    else:
+        quiet = "\U0001f514 Тихі години вимкнено"
+    return ("⚙️ Налаштування сповіщень\n\n"
+            f"{quiet}\n"
+            f"\U0001f4e3 Надсилати: {MODE_TEXT.get(s.notify_mode, s.notify_mode)}")
+
+
 def format_battery_line(fc) -> str:
     """'🪫 Батареї вистачить ще ~1 год 40 хв (−18%/год)' from battery.Forecast"""
     return (f"\U0001faab Батареї вистачить ще ~{format_duration(fc.seconds_left)} "

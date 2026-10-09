@@ -199,6 +199,7 @@ Restore: `gunzip -c <dump>.sql.gz | sudo -u postgres psql luxpower` (into an emp
 | `/history` | Outage statistics for last 24 hours |
 | `/subscribe` | Enable outage notifications |
 | `/unsubscribe` | Disable notifications |
+| `/settings` | Quiet hours (default 23:00–07:00, messages arrive silently) and which changes to send (all / outages only / grid back only) |
 
 ### Private Bot (owner only)
 

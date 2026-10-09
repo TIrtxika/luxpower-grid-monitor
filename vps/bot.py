@@ -39,10 +39,12 @@ import stats as grid_stats
 import menus
 from messages import (
     format_history_summary, format_inverter_details, format_outages,
-    format_battery_line, format_periods, format_stats, format_traffic_light,
+    format_battery_line, format_periods, format_settings, format_stats,
+    format_traffic_light,
     status_from_sample,
 )
 from battery import forecast as battery_forecast
+from subscriptions import MODES, QUIET_WINDOWS
 import charts
 from notifiers import Notice, ntfy_from_config
 
@@ -94,7 +96,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/grid - Статистика наявності світла\n"
         "/history - Історія відключень за 24 години\n"
         "/subscribe - Підписатися на сповіщення\n"
-        "/unsubscribe - Відписатися від сповіщень\n\n"
+        "/unsubscribe - Відписатися від сповіщень\n"
+        "/settings - Тихі години (за замовчуванням 23:00–07:00 беззвучно) "
+        "та які сповіщення надсилати\n\n"
         "\U0001f7e2 є світло  \U0001f534 немає  \U0001f7e1 невідомо\n"
         "Бот автоматично надсилає повідомлення при зміні стану мережі."
     )
@@ -137,6 +141,54 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message)
 
 
+NOT_SUBSCRIBED = "Спершу підпишіться на сповіщення: /subscribe"
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /settings: quiet hours and which alerts to send"""
+    settings = get_db().get_settings(update.effective_chat.id)
+    if settings is None:
+        await update.message.reply_text(NOT_SUBSCRIBED)
+        return
+    await update.message.reply_text(format_settings(settings),
+                                    reply_markup=menus.settings_keyboard(settings))
+
+
+def _settings_change(data: str) -> Optional[dict]:
+    """'set:<kind>:<value>' -> fields for update_settings, None if invalid"""
+    parts = (data or '').split(':')
+    if len(parts) != 3 or parts[0] != 'set':
+        return None
+    _, kind, value = parts
+    if kind == 'quiet' and value in ('on', 'off'):
+        return {'quiet_enabled': value == 'on'}
+    if kind == 'window' and value in QUIET_WINDOWS:
+        start, end = QUIET_WINDOWS[value]
+        return {'quiet_from': start, 'quiet_to': end}
+    if kind == 'mode' and value in MODES:
+        return {'notify_mode': value}
+    return None
+
+
+async def callback_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/settings buttons"""
+    query = update.callback_query
+    chat_id = query.message.chat.id
+    db = get_db()
+    if db.get_settings(chat_id) is None:
+        await query.answer(NOT_SUBSCRIBED, show_alert=True)
+        return
+    change = _settings_change(query.data)
+    if change is None:
+        await query.answer()
+        return
+    db.update_settings(chat_id, **change)
+    settings = db.get_settings(chat_id)
+    await query.answer("Збережено")
+    await query.edit_message_text(format_settings(settings),
+                                  reply_markup=menus.settings_keyboard(settings))
+
+
 async def cmd_toggle_notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """🔔 button: subscribe or unsubscribe"""
     if get_db().is_subscribed(update.effective_chat.id):
@@ -151,6 +203,7 @@ PUBLIC_ACTIONS = {
     'grid': 'cmd_grid',
     'history': 'cmd_history',
     'notify': 'cmd_toggle_notify',
+    'settings': 'cmd_settings',
 }
 
 PRIVATE_ACTIONS = {
@@ -559,6 +612,8 @@ def run_public_bot():
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
     app.add_handler(CommandHandler("grid", cmd_grid))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CallbackQueryHandler(callback_settings, pattern="^set:"))
 
     app.add_handler(CallbackQueryHandler(callback_history_detail, pattern="^history_"))
     app.add_handler(CallbackQueryHandler(callback_grid, pattern="^grid_"))
