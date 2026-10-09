@@ -417,67 +417,6 @@ class Database:
                     """, (hours, limit))
                 return [dict(row) for row in cur.fetchall()]
 
-    def get_grid_statistics(self, hours: int = 24) -> Dict:
-        """Calculate grid outage statistics"""
-        events = self.get_events(hours=hours)
-
-        grid_events = [e for e in events if e['event_type'] in ('grid_on', 'grid_off')]
-
-        outage_count = 0
-        total_duration = 0
-
-        for event in grid_events:
-            if event['event_type'] == 'grid_on':
-                outage_count += 1
-                duration = event.get('data', {}).get('duration_seconds', 0)
-                if duration:
-                    total_duration += duration
-
-        return {
-            'period_hours': hours,
-            'outage_count': outage_count,
-            'total_duration_seconds': total_duration,
-            'total_duration_minutes': round(total_duration / 60, 1)
-        }
-
-    # =========================================================================
-    # GRID AVAILABILITY STATS
-    # =========================================================================
-
-    def _get_grid_stats_by_period(self, trunc: str, interval: str) -> List[Dict]:
-        """Get grid availability grouped by time period.
-
-        Args:
-            trunc: PostgreSQL date_trunc unit ('day', 'week', 'month')
-            interval: PostgreSQL interval string ('7 days', '4 weeks', '6 months')
-        """
-        with self.get_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(f"""
-                    SELECT
-                        date_trunc('{trunc}', timestamp) as period,
-                        COUNT(*) FILTER (WHERE grid_available = true) as on_count,
-                        COUNT(*) FILTER (WHERE grid_available = false) as off_count,
-                        COUNT(*) as total
-                    FROM inverter_status
-                    WHERE timestamp > NOW() - INTERVAL '{interval}'
-                    GROUP BY period
-                    ORDER BY period
-                """)
-                return [dict(row) for row in cur.fetchall()]
-
-    def get_daily_grid_stats(self, days: int = 7) -> List[Dict]:
-        """Grid availability per day for the last N days"""
-        return self._get_grid_stats_by_period('day', f'{days} days')
-
-    def get_weekly_grid_stats(self, weeks: int = 4) -> List[Dict]:
-        """Grid availability per week for the last N weeks"""
-        return self._get_grid_stats_by_period('week', f'{weeks} weeks')
-
-    def get_monthly_grid_stats(self, months: int = 6) -> List[Dict]:
-        """Grid availability per month for the last N months"""
-        return self._get_grid_stats_by_period('month', f'{months} months')
-
     # =========================================================================
     # SUBSCRIBERS METHODS
     # =========================================================================
@@ -529,25 +468,6 @@ class Database:
     # =========================================================================
     # CLEANUP METHODS
     # =========================================================================
-
-    def cleanup_old_data(self, days: int = 30):
-        """Remove data older than specified days"""
-        with self.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    DELETE FROM inverter_status
-                    WHERE timestamp < NOW() - INTERVAL '%s days'
-                """, (days,))
-                deleted_status = cur.rowcount
-
-                cur.execute("""
-                    DELETE FROM events
-                    WHERE timestamp < NOW() - INTERVAL '%s days'
-                """, (days,))
-                deleted_events = cur.rowcount
-
-                logger.info(f"Cleanup: removed {deleted_status} status records, "
-                           f"{deleted_events} events")
 
     def cleanup_status(self, days: int) -> int:
         """Remove inverter_status samples older than `days`"""

@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import alerts
 import bot
+from stats import Interval
 
 SUMMER_UTC = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
 WINTER_UTC = datetime(2026, 12, 1, 12, 0, tzinfo=timezone.utc)
@@ -31,9 +32,11 @@ class KyivTzTest(unittest.TestCase):
 
 class HistoryDetailTest(unittest.TestCase):
     def test_history_shows_kyiv_time_for_utc_timestamp(self):
+        start = datetime.now(timezone.utc).replace(second=0, microsecond=0) \
+            - timedelta(hours=3)
         db = MagicMock()
-        db.get_events.return_value = [
-            {'event_type': 'grid_off', 'timestamp': SUMMER_UTC, 'data': {}},
+        db.get_intervals.return_value = [
+            Interval('off', start, start + timedelta(hours=1)),
         ]
         query = MagicMock()
         query.answer = AsyncMock()
@@ -44,7 +47,8 @@ class HistoryDetailTest(unittest.TestCase):
             asyncio.run(bot.callback_history_detail(update, MagicMock()))
 
         text = query.edit_message_text.call_args.args[0]
-        self.assertIn('15:00 01.07', text)
+        expected = start.astimezone(bot.KYIV_TZ).strftime('%H:%M %d.%m')
+        self.assertIn(expected, text)
 
 
 if __name__ == '__main__':
