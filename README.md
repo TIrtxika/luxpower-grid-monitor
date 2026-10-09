@@ -132,6 +132,9 @@ sudo systemctl enable --now luxpower-bot-public luxpower-bot-private
 | `NTFY_URL` | `https://ntfy.sh` | ntfy server for owner alerts outside Telegram |
 | `NTFY_TOPIC` | — | Secret ntfy topic (empty = ntfy disabled); test with `/ntfytest` in the private bot |
 | `NTFY_TOKEN` | — | Optional ntfy access token (sent as `Authorization: Bearer`) |
+| `BATTERY_EMPTY_SOC` | 10 | SOC (%) treated as empty for the runtime forecast |
+| `BATTERY_ALERT_LEVELS` | `30,15` | SOC thresholds for owner warnings during an outage (the lowest is urgent) |
+| `HEALTHCHECK_URL` | — | healthchecks.io ping URL; the poller pings it every poll so you are alerted if the VPS or the bot goes silent (empty = disabled) |
 
 ### Grid state history (`grid_intervals`)
 

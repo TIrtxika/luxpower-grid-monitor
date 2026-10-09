@@ -39,8 +39,10 @@ import stats as grid_stats
 import menus
 from messages import (
     format_history_summary, format_inverter_details, format_outages,
-    format_periods, format_stats, format_traffic_light, status_from_sample,
+    format_battery_line, format_periods, format_stats, format_traffic_light,
+    status_from_sample,
 )
+from battery import forecast as battery_forecast
 import charts
 from notifiers import Notice, ntfy_from_config
 
@@ -340,6 +342,21 @@ def _private_traffic_light(open_iv: Optional[dict], now: datetime) -> str:
                                 open_iv['started_at'], now)
 
 
+def _battery_line(db, open_iv: Optional[dict], now: datetime) -> Optional[str]:
+    """Runtime forecast from DB samples of the current outage (private bot)"""
+    if not open_iv or open_iv['state'] != 'off':
+        return None
+    try:
+        rows = db.get_status_history(1)
+    except Exception as e:
+        logger.warning(f"Failed to load samples for battery forecast: {e}")
+        return None
+    samples = [(r['timestamp'].timestamp(), r.get('battery_soc')) for r in rows
+               if r['timestamp'] >= open_iv['started_at']]
+    fc = battery_forecast(samples, now.timestamp(), config.BATTERY_EMPTY_SOC)
+    return format_battery_line(fc) if fc else None
+
+
 @owner_only
 async def cmd_full_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /status and /fullstatus (private bot)"""
@@ -352,6 +369,9 @@ async def cmd_full_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.warning(f"Failed to get open interval: {e}")
     header = _private_traffic_light(open_iv, now)
+    battery_line = _battery_line(db, open_iv, now)
+    if battery_line:
+        header += "\n" + battery_line
 
     # Fresh data from the RPi without blocking the bot's event loop
     status = await asyncio.to_thread(fetch_status_direct)
@@ -511,6 +531,7 @@ def run_public_bot():
         alert_manager.set_event_loop(asyncio.get_running_loop())
         poller.add_state_callback(alert_manager.on_grid_change)
         poller.add_unknown_callback(alert_manager.on_unknown_change)
+        poller.add_battery_callback(alert_manager.on_low_battery)
         poller.start()
 
     async def on_stop(application: Application):
