@@ -3,7 +3,7 @@ Text formatting for bot replies: durations, availability bars, outage lists
 """
 
 from datetime import datetime, timedelta
-from typing import List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 from stats import Outage, OutageSummary, PeriodStats, availability_pct
@@ -158,3 +158,69 @@ def format_since(start: datetime, now: datetime) -> str:
     time_str = s.strftime('%H:%M') if s.date() == n.date() else s.strftime('%H:%M %d.%m')
     # Timestamps, not (n - s): both share one ZoneInfo, which would ignore DST
     return f"З {time_str} ({format_duration(now.timestamp() - start.timestamp())})"
+
+
+TRAFFIC_LIGHT = {
+    'on': "\U0001f7e2 Світло є",
+    'off': "\U0001f534 Світла немає",
+    'unknown': "\U0001f7e1 Невідомо",
+}
+
+
+def format_traffic_light(state: str, reason: Optional[str],
+                         since: Optional[datetime], now: datetime,
+                         voltage: Optional[float] = None,
+                         data_age_s: Optional[float] = None) -> str:
+    """Status header: 🟢 / 🔴 / 🟡 with since, voltage or data age"""
+    header = TRAFFIC_LIGHT.get(state, TRAFFIC_LIGHT['unknown'])
+    if state not in ('on', 'off') and reason:
+        header += f" — {reason}"
+    lines = [header]
+    if since is not None:
+        lines.append(format_since(since, now))
+    if state in ('on', 'off'):
+        if voltage is not None:
+            lines.append(f"Напруга: {voltage}V")
+    elif data_age_s is not None:
+        lines.append(f"Останні дані: {format_duration(data_age_s)} тому")
+    return "\n".join(lines)
+
+
+def format_inverter_details(status: Dict) -> str:
+    """Grid, battery, load, temperatures from an RPi status dict"""
+    grid = status.get('grid') or {}
+    battery = status.get('battery') or {}
+    output = status.get('output') or {}
+    temp = status.get('temperature') or {}
+    return (
+        f"⚡ Мережа: {grid.get('voltage', 0)}V / {grid.get('frequency', 0)}Hz\n\n"
+        f"\U0001faab Батарея: {battery.get('soc', 0)}%\n"
+        f"   Напруга: {battery.get('voltage', 0)}V\n"
+        f"   Струм: {battery.get('current', 0)}A\n"
+        f"   Потужність: {battery.get('power', 0)}W\n\n"
+        f"\U0001f3e0 Навантаження: {output.get('load_power', 0)}W\n"
+        f"   Вихід: {output.get('voltage', 0)}V / {output.get('frequency', 0)}Hz\n\n"
+        f"\U0001f321 Температура:\n"
+        f"   Інвертор: {temp.get('inverter', 0)}°C\n"
+        f"   Радіатор: {temp.get('radiator', 0)}°C\n\n"
+        f"DC Bus: {status.get('dc_bus_voltage', 0)}V"
+    )
+
+
+def status_from_sample(row: Dict) -> Dict:
+    """inverter_status DB row -> RPi-style status dict"""
+    return {
+        'grid': {'available': row.get('grid_available'),
+                 'voltage': row.get('grid_voltage'),
+                 'frequency': row.get('grid_frequency')},
+        'battery': {'soc': row.get('battery_soc'),
+                    'voltage': row.get('battery_voltage'),
+                    'current': row.get('battery_current'),
+                    'power': row.get('battery_power')},
+        'output': {'load_power': row.get('load_power'),
+                   'voltage': row.get('output_voltage'),
+                   'frequency': row.get('output_frequency')},
+        'temperature': {'inverter': row.get('inverter_temp'),
+                        'radiator': row.get('radiator_temp')},
+        'dc_bus_voltage': row.get('dc_bus_voltage'),
+    }

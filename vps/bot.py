@@ -6,6 +6,7 @@ Main entry point for bot services
 
 import logging
 import sys
+import time
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -31,11 +32,12 @@ import config
 from database import get_db, close_db
 from poller import get_poller
 from alerts import AlertManager, UNKNOWN_REASONS_UA
-from grid_state import ON, OFF
+from grid_state import UNKNOWN
 import stats as grid_stats
+import menus
 from messages import (
-    format_history_summary, format_outages, format_periods, format_since,
-    format_stats,
+    format_history_summary, format_inverter_details, format_outages,
+    format_periods, format_stats, format_traffic_light, status_from_sample,
 )
 import graphs
 
@@ -59,12 +61,11 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     user = update.effective_user
-    chat_id = update.effective_chat.id
 
     welcome = (
         f"Привіт, {user.first_name}!\n\n"
-        "Цей бот показує стан електромережі.\n\n"
-        "Команди:\n"
+        "Цей бот показує стан електромережі.\n"
+        "Користуйтесь кнопками внизу або командами:\n\n"
         "/status - Поточний стан\n"
         "/grid - Статистика наявності світла\n"
         "/history - Історія відключень\n"
@@ -73,7 +74,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help - Допомога"
     )
 
-    await update.message.reply_text(welcome)
+    await update.message.reply_text(welcome,
+                                    reply_markup=menus.public_keyboard())
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -85,15 +87,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/history - Історія відключень за 24 години\n"
         "/subscribe - Підписатися на сповіщення\n"
         "/unsubscribe - Відписатися від сповіщень\n\n"
+        "\U0001f7e2 є світло  \U0001f534 немає  \U0001f7e1 невідомо\n"
         "Бот автоматично надсилає повідомлення при зміні стану мережі."
     )
-    await update.message.reply_text(help_text)
+    await update.message.reply_text(help_text,
+                                    reply_markup=menus.public_keyboard())
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /status command"""
+    """Handle /status command: traffic light 🟢 / 🔴 / 🟡"""
     poller = get_poller()
-    status = poller.get_last_status()
+    status = poller.get_last_status() or {}
     state = poller.get_effective_state()
 
     if state is None:
@@ -102,26 +106,65 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    voltage = ((status or {}).get('grid') or {}).get('voltage', 0)
-    if state == ON:
-        message = f"✅ Електромережа: УВІМКНЕНО\nНапруга: {voltage}V"
-    elif state == OFF:
-        message = f"❌ Електромережа: ВИМКНЕНО\nНапруга: {voltage}V"
-    else:
-        reason = UNKNOWN_REASONS_UA.get(poller.get_state_reason(),
-                                        "невідома причина")
-        message = f"⚠️ Немає свіжих даних про мережу\nПричина: {reason}"
-
+    now = datetime.now(timezone.utc)
+    since = None
     try:
         open_iv = get_db().get_open_interval()
         if open_iv:
-            message += "\n" + format_since(open_iv['started_at'],
-                                           datetime.now(timezone.utc))
+            since = open_iv['started_at']
     except Exception as e:
         logger.warning(f"Failed to get open interval for status: {e}")
 
+    reason = None
+    if state == UNKNOWN:
+        reason = UNKNOWN_REASONS_UA.get(poller.get_state_reason(),
+                                        "невідома причина")
+    data_ts = status.get('timestamp')
+    data_age = time.time() - data_ts if data_ts else None
+    voltage = (status.get('grid') or {}).get('voltage')
+
+    message = format_traffic_light(state, reason, since, now,
+                                   voltage=voltage, data_age_s=data_age)
     message += f"\n\nОновлено: {kyiv_now().strftime('%H:%M:%S')}"
     await update.message.reply_text(message)
+
+
+async def cmd_toggle_notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🔔 button: subscribe or unsubscribe"""
+    if get_db().is_subscribed(update.effective_chat.id):
+        await cmd_unsubscribe(update, context)
+    else:
+        await cmd_subscribe(update, context)
+
+
+# Reply keyboard button action -> handler name (looked up at call time)
+PUBLIC_ACTIONS = {
+    'status': 'cmd_status',
+    'grid': 'cmd_grid',
+    'history': 'cmd_history',
+    'notify': 'cmd_toggle_notify',
+}
+
+PRIVATE_ACTIONS = {
+    'status': 'cmd_full_status',
+    'chart': 'cmd_chart',
+    'stats': 'cmd_stats',
+    'subscribers': 'cmd_subscribers',
+}
+
+
+async def on_public_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply keyboard button of the public bot"""
+    action = menus.PUBLIC_BUTTONS.get(update.message.text)
+    if action:
+        await globals()[PUBLIC_ACTIONS[action]](update, context)
+
+
+async def on_private_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply keyboard button of the private bot"""
+    action = menus.PRIVATE_BUTTONS.get(update.message.text)
+    if action:
+        await globals()[PRIVATE_ACTIONS[action]](update, context)
 
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -262,42 +305,66 @@ def fetch_status_direct() -> dict:
 
 
 @owner_only
+async def cmd_private_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start and /help in the private bot"""
+    help_text = (
+        "\U0001f510 Бот власника\n\n"
+        "/status - Повний статус інвертора\n"
+        "/chart - Графіки\n"
+        "/stats - Статистика відключень\n"
+        "/subscribers - Кількість підписників\n"
+        "/help - Допомога"
+    )
+    await update.message.reply_text(help_text,
+                                    reply_markup=menus.private_keyboard())
+
+
+def _private_traffic_light(open_iv: Optional[dict], now: datetime) -> str:
+    """Traffic light from the DB (the private bot runs no poller)"""
+    if not open_iv:
+        return format_traffic_light(UNKNOWN, "немає даних", None, now)
+    max_gap = 3 * config.POLL_INTERVAL
+    if now.timestamp() - open_iv['last_seen_at'].timestamp() > max_gap:
+        return format_traffic_light(UNKNOWN, "моніторинг не працює",
+                                    open_iv['last_seen_at'], now)
+    return format_traffic_light(open_iv['state'], None,
+                                open_iv['started_at'], now)
+
+
+@owner_only
 async def cmd_full_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /fullstatus command (private bot)"""
-    # Try poller first, then fetch directly
-    poller = get_poller()
-    status = poller.get_last_status()
+    """Handle /status and /fullstatus (private bot)"""
+    now = datetime.now(timezone.utc)
+    db = get_db()
+
+    open_iv = None
+    try:
+        open_iv = db.get_open_interval()
+    except Exception as e:
+        logger.warning(f"Failed to get open interval: {e}")
+    header = _private_traffic_light(open_iv, now)
+
+    # Fresh data from the RPi without blocking the bot's event loop
+    status = await asyncio.to_thread(fetch_status_direct)
+    note = ""
+    if not status:
+        try:
+            row = db.get_latest_status()
+        except Exception as e:
+            logger.warning(f"Failed to get latest sample: {e}")
+            row = None
+        if row:
+            status = status_from_sample(row)
+            taken = row['timestamp'].astimezone(KYIV_TZ)
+            note = f"\n\n⏱ Дані за {taken:%H:%M %d.%m} (RPi не відповідає)"
 
     if not status:
-        status = fetch_status_direct()
-
-    if not status:
-        await update.message.reply_text("\u26a0 Дані недоступні")
+        await update.message.reply_text(f"{header}\n\n⚠ Дані інвертора недоступні")
         return
 
-    grid = status.get('grid', {})
-    battery = status.get('battery', {})
-    output = status.get('output', {})
-    temp = status.get('temperature', {})
-
-    grid_emoji = "\u2705" if grid.get('available') else "\u274c"
-
-    message = (
-        f"\U0001f50b Повний статус інвертора\n\n"
-        f"{grid_emoji} Мережа: {grid.get('voltage', 0)}V / {grid.get('frequency', 0)}Hz\n\n"
-        f"\U0001faab Батарея: {battery.get('soc', 0)}%\n"
-        f"   Напруга: {battery.get('voltage', 0)}V\n"
-        f"   Струм: {battery.get('current', 0)}A\n"
-        f"   Потужність: {battery.get('power', 0)}W\n\n"
-        f"\U0001f3e0 Навантаження: {output.get('load_power', 0)}W\n"
-        f"   Вихід: {output.get('voltage', 0)}V / {output.get('frequency', 0)}Hz\n\n"
-        f"\U0001f321 Температура:\n"
-        f"   Інвертор: {temp.get('inverter', 0)}°C\n"
-        f"   Радіатор: {temp.get('radiator', 0)}°C\n\n"
-        f"DC Bus: {status.get('dc_bus_voltage', 0)}V"
+    await update.message.reply_text(
+        f"{header}\n\n{format_inverter_details(status)}{note}"
     )
-
-    await update.message.reply_text(message)
 
 
 @owner_only
@@ -391,6 +458,14 @@ async def cmd_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # =============================================================================
 
+async def _set_commands(application: Application, commands) -> None:
+    """Fill the "/" command menu; a failure must not stop the bot"""
+    try:
+        await application.bot.set_my_commands(commands)
+    except Exception as e:
+        logger.warning(f"Failed to set bot commands: {type(e).__name__}")
+
+
 async def _init_owner_bot(owner_bot: Bot) -> Optional[Bot]:
     """Initialize the private bot used for owner alerts, None if it fails.
 
@@ -416,6 +491,7 @@ def run_public_bot():
 
     async def on_start(application: Application):
         """Wire alerts and start polling once the bot loop is running"""
+        await _set_commands(application, menus.PUBLIC_COMMANDS)
         alert_manager = AlertManager(application.bot,
                                      await _init_owner_bot(private_bot))
         alert_manager.set_event_loop(asyncio.get_running_loop())
@@ -451,6 +527,8 @@ def run_public_bot():
 
     app.add_handler(CallbackQueryHandler(callback_history_detail, pattern="^history_"))
     app.add_handler(CallbackQueryHandler(callback_grid, pattern="^grid_"))
+    app.add_handler(MessageHandler(filters.Text(list(menus.PUBLIC_BUTTONS)),
+                                   on_public_button))
 
     logger.info("Public bot started")
 
@@ -464,11 +542,18 @@ def run_private_bot():
     """Run private bot only"""
     logger.info("Starting private bot...")
 
+    async def on_start(application: Application):
+        await _set_commands(application, menus.PRIVATE_COMMANDS)
+
     # Create application
-    app = Application.builder().token(config.PRIVATE_BOT_TOKEN).build()
+    app = (Application.builder()
+           .token(config.PRIVATE_BOT_TOKEN)
+           .post_init(on_start)
+           .build())
 
     # Add handlers
-    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("start", cmd_private_help))
+    app.add_handler(CommandHandler("help", cmd_private_help))
     app.add_handler(CommandHandler("status", cmd_full_status))
     app.add_handler(CommandHandler("fullstatus", cmd_full_status))
     app.add_handler(CommandHandler("chart", cmd_chart))
@@ -476,6 +561,8 @@ def run_private_bot():
     app.add_handler(CommandHandler("subscribers", cmd_subscribers))
 
     app.add_handler(CallbackQueryHandler(callback_chart, pattern="^chart_"))
+    app.add_handler(MessageHandler(filters.Text(list(menus.PRIVATE_BUTTONS)),
+                                   on_private_button))
 
     logger.info("Private bot started")
 
