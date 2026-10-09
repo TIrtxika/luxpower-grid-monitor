@@ -57,6 +57,20 @@ UNKNOWN_ALERT_AFTER = int(os.environ.get("UNKNOWN_ALERT_AFTER", "300"))
 # Скільки днів зберігати зразки inverter_status
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
 
+# SOC, на якому інвертор вважає батарею порожньою (для прогнозу)
+BATTERY_EMPTY_SOC = int(os.environ.get("BATTERY_EMPTY_SOC", "10"))
+
+# Пороги SOC (%) для попереджень власнику під час відключення
+BATTERY_ALERT_LEVELS = tuple(
+    int(x) for x in os.environ.get("BATTERY_ALERT_LEVELS", "30,15").split(",")
+    if x.strip()
+)
+
+# =============================================================================
+# WATCHDOG — зовнішній сторож (healthchecks.io), порожній = вимкнено
+# =============================================================================
+HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "")
+
 # Канал для публічних сповіщень (опціонально)
 PUBLIC_CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL_ID", "")
 

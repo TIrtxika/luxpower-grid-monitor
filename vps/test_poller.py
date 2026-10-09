@@ -5,18 +5,23 @@ Run: python -m unittest test_poller
 
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
 
+import poller as poller_mod
 from grid_state import GridChange
 from poller import RpiPoller
+
+HC_URL = "https://hc-ping.com/00000000-test-uuid"
 
 
 def dt(ts):
     return datetime.fromtimestamp(ts, timezone.utc)
 
 
-def st(available=True, connected=True):
+def st(available=True, connected=True, soc=None):
     return {'connected': connected, 'data_age_seconds': 5,
-            'grid': {'available': available, 'voltage': 230}}
+            'grid': {'available': available, 'voltage': 230},
+            'battery': {'soc': soc}}
 
 
 class FakeDb:
@@ -74,6 +79,9 @@ class Harness:
         self.poller.add_state_callback(lambda c, s: self.changes.append(c))
         self.poller.add_unknown_callback(
             lambda a, r, sec: self.unknown.append((a, r, sec)))
+        self.battery = []
+        self.poller.add_battery_callback(
+            lambda level, soc, fc: self.battery.append((level, soc, fc)))
         self.poller.init_state()
 
     def poll(self, t, status):
@@ -179,6 +187,56 @@ class PollerTest(unittest.TestCase):
         h = Harness(db)
         h.poll(0, st(True))
         self.assertEqual(db.switches, [('on', dt(-1000))])
+
+    def test_low_battery_alerts_once_per_threshold_with_forecast(self):
+        h = Harness(seeded('off'))
+        for i, soc in enumerate([40, 38, 36, 34, 32, 31, 30, 29]):
+            h.poll(i * 120, st(False, soc=soc))
+        self.assertEqual([(lvl, soc) for lvl, soc, _ in h.battery], [(30, 30)])
+        fc = h.battery[0][2]
+        self.assertIsNotNone(fc)
+        self.assertGreater(fc.rate_per_hour, 0)
+
+    def test_no_battery_alert_while_grid_on(self):
+        h = Harness(seeded('on'))
+        h.poll(0, st(True, soc=10))
+        self.assertEqual(h.battery, [])
+
+    def test_battery_thresholds_rearm_after_grid_returns(self):
+        h = Harness(seeded('off'))
+        h.poll(0, st(False, soc=25))
+        for t in (60, 120, 180):
+            h.poll(t, st(True, soc=26))
+        for t in (240, 300, 360, 420):
+            h.poll(t, st(False, soc=28))
+        self.assertEqual([lvl for lvl, _, _ in h.battery], [30, 30])
+
+    def test_watchdog_pinged_every_poll_even_when_rpi_down(self):
+        h = Harness(seeded('on'))
+        with patch.object(poller_mod.config, 'HEALTHCHECK_URL', HC_URL), \
+             patch.object(poller_mod.requests, 'get',
+                          return_value=MagicMock(status_code=200)) as get:
+            h.poll(0, st(True))
+            h.poll(60, None)
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args.args[0], HC_URL)
+        self.assertEqual(get.call_args.kwargs['timeout'], 5)
+
+    def test_watchdog_disabled_without_url(self):
+        h = Harness(seeded('on'))
+        with patch.object(poller_mod.config, 'HEALTHCHECK_URL', ''), \
+             patch.object(poller_mod.requests, 'get') as get:
+            h.poll(0, st(True))
+        get.assert_not_called()
+
+    def test_watchdog_failure_is_logged_without_url(self):
+        h = Harness(seeded('on'))
+        with patch.object(poller_mod.config, 'HEALTHCHECK_URL', HC_URL), \
+             patch.object(poller_mod.requests, 'get',
+                          side_effect=poller_mod.requests.ConnectionError(HC_URL)), \
+             self.assertLogs('poller', level='WARNING') as logs:
+            h.poll(0, st(True))
+        self.assertNotIn(HC_URL, "\n".join(logs.output))
 
     def test_empty_db_first_poll_opens_interval_without_alert(self):
         h = Harness(FakeDb())
