@@ -7,8 +7,9 @@ import unittest
 from datetime import datetime
 
 from messages import (
-    BAR_OFF, BAR_ON, BAR_UNKNOWN, format_duration, format_outages,
-    format_periods, format_since, make_bar,
+    BAR_OFF, BAR_ON, BAR_UNKNOWN, format_duration, format_inverter_details,
+    format_outages, format_periods, format_since, format_traffic_light,
+    make_bar, status_from_sample,
 )
 from stats import KYIV_TZ, Outage, PeriodStats
 
@@ -61,6 +62,62 @@ class MessagesTest(unittest.TestCase):
         # 2026-10-25 04:00 EEST -> 03:00 EET: 00:00 -> 06:00 is 7 real hours
         self.assertEqual(format_since(K(2026, 10, 25, 0), K(2026, 10, 25, 6)),
                          "З 00:00 (7 год)")
+
+
+class TrafficLightTest(unittest.TestCase):
+    NOW = K(2026, 10, 9, 12)
+
+    def test_on(self):
+        text = format_traffic_light('on', None, K(2026, 10, 9, 10), self.NOW,
+                                    voltage=231)
+        self.assertEqual(text.split("\n"),
+                         ["\U0001f7e2 Світло є", "З 10:00 (2 год)", "Напруга: 231V"])
+
+    def test_off(self):
+        text = format_traffic_light('off', None, K(2026, 10, 9, 11), self.NOW,
+                                    voltage=0)
+        self.assertTrue(text.startswith("\U0001f534 Світла немає\nЗ 11:00 (1 год)"))
+
+    def test_unknown_shows_reason_and_data_age_without_voltage(self):
+        text = format_traffic_light('unknown', "дані застарілі",
+                                    K(2026, 10, 9, 11, 30), self.NOW,
+                                    voltage=230, data_age_s=600)
+        self.assertEqual(text.split("\n"),
+                         ["\U0001f7e1 Невідомо — дані застарілі",
+                          "З 11:30 (30 хв)", "Останні дані: 10 хв тому"])
+
+    def test_without_since(self):
+        self.assertEqual(format_traffic_light('on', None, None, self.NOW),
+                         "\U0001f7e2 Світло є")
+
+
+class InverterDetailsTest(unittest.TestCase):
+    def test_details(self):
+        text = format_inverter_details({
+            'grid': {'voltage': 230, 'frequency': 50},
+            'battery': {'soc': 80, 'voltage': 52.1, 'current': -3, 'power': -150},
+            'output': {'load_power': 420, 'voltage': 230, 'frequency': 50},
+            'temperature': {'inverter': 40, 'radiator': 35.5},
+            'dc_bus_voltage': 380,
+        })
+        self.assertIn("Мережа: 230V / 50Hz", text)
+        self.assertIn("Батарея: 80%", text)
+        self.assertIn("Навантаження: 420W", text)
+        self.assertIn("DC Bus: 380V", text)
+
+    def test_sample_to_status(self):
+        status = status_from_sample({
+            'grid_available': True, 'grid_voltage': 229.5, 'grid_frequency': 50.0,
+            'battery_soc': 77, 'battery_voltage': 52.0, 'battery_current': 1.5,
+            'battery_power': 78.0, 'load_power': 300, 'output_voltage': 230.0,
+            'output_frequency': 50.0, 'inverter_temp': 41, 'radiator_temp': 36.0,
+            'dc_bus_voltage': 380.0,
+        })
+        self.assertEqual(status['grid'], {'available': True, 'voltage': 229.5,
+                                          'frequency': 50.0})
+        self.assertEqual(status['battery']['soc'], 77)
+        self.assertEqual(status['output']['load_power'], 300)
+        self.assertEqual(status['temperature'], {'inverter': 41, 'radiator': 36.0})
 
 
 if __name__ == '__main__':
